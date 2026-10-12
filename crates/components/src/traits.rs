@@ -5,15 +5,8 @@
 //! [`crate::ComponentRegistry::with_builtins`]; external adapter crates
 //! implement these traits and register their factories at their own binary entry points.
 //!
-//! **Adding a backend must never require a change to this repository.** A
-//! factory registered from outside is looked up by the same path as a built-in
-//! one and receives the same [`BackendBuildContext`] — including the assembled
-//! `graph_postgres_url` / `vector_postgres_url`, which are resolved for every
-//! provider id rather than only the built-in Postgres ones, so a
-//! Postgres-backed external provider needs nothing from here but a
-//! `register_*` call. Nothing in this crate may validate a provider id against
-//! a fixed list; the registry's lookup is the only authority. See
-//! `docs/guides/external-providers.md`.
+//! Adding a backend must never require a change to this repository — see
+//! `docs/guides/external-providers.md` for what that commits this crate to.
 //!
 //! All traits are `Send + Sync` and use `#[async_trait]` so that
 //! `Arc<dyn XFactory>` is dyn-compatible and the holding `ComponentManager`

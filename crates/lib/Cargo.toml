@@ -192,11 +192,6 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-# Not optional: `build_postgres_url` assembles the Postgres URL offered to
-# EVERY provider in `Settings::backend_context`, including externally
-# registered ones, so it cannot be gated on the built-in `pgvector` / `pggraph`
-# features. Already in the dependency graph of a --no-default-features build,
-# so making it direct costs no extra compilation.
 url = { workspace = true }
 uuid.workspace = true
 
