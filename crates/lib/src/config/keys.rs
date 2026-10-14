@@ -559,6 +559,70 @@ impl Settings {
     }
 }
 
+/// One value of [`Settings`]' `Debug` output: compact JSON, or the
+/// [`REDACTED`](cognee_config_core::REDACTED) marker for a non-null secret
+/// (an empty one too, so the output reveals only that it is set).
+struct ShownValue<'a> {
+    value: &'a Value,
+    secret: bool,
+}
+
+impl std::fmt::Debug for ShownValue<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.secret && !self.value.is_null() {
+            f.write_str(cognee_config_core::REDACTED)
+        } else {
+            write!(f, "{}", self.value)
+        }
+    }
+}
+
+/// The `sections` map of [`Settings`]' `Debug` output, secrets masked.
+struct ShownSections<'a>(&'a cognee_config_core::ConfigValues);
+
+impl std::fmt::Debug for ShownSections<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let schema = builtin_schema();
+        let mut map = f.debug_map();
+        for (key, value) in self.0 {
+            // A key of a built-in section (or an alias of one) is masked by its
+            // `secret` flag. A key no built-in section owns belongs to a
+            // section a custom registry adds (or is stale), so whether it is a
+            // credential is unknown here: its value is masked unless it is a
+            // boolean or a number.
+            let secret = match schema.key_def(key) {
+                Some(def) => def.secret,
+                None => !(value.is_boolean() || value.is_number()),
+            };
+            map.entry(&key, &ShownValue { value, secret });
+        }
+        map.finish()
+    }
+}
+
+/// Never prints a credential: every setting is shown as JSON, and a setting
+/// marked `secret` (a registry row, or a section key) is replaced by
+/// [`REDACTED`](cognee_config_core::REDACTED). A `sections` entry that no
+/// built-in section owns is masked too unless it is a boolean or a number,
+/// since only the registry that owns it knows whether it is a secret.
+impl std::fmt::Debug for Settings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut out = f.debug_struct("Settings");
+        for spec in KEYS {
+            let value = (spec.get)(self);
+            out.field(
+                spec.key,
+                &ShownValue {
+                    value: &value,
+                    secret: spec.secret,
+                },
+            );
+        }
+        out.field("sections", &ShownSections(&self.sections));
+        out.finish()
+    }
+}
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -700,6 +764,45 @@ mod tests {
         let patch = serde_json::json!({ "enable_access_control": false });
         cm.apply_patch(patch.as_object().unwrap()).unwrap();
         cm.check_strict().unwrap();
+    }
+
+    /// `{:?}` of `Settings` never prints a credential: a secret row, a
+    /// built-in section secret (canonical or alias), or a string under a key
+    /// no built-in section owns.
+    #[test]
+    fn settings_debug_redacts_secrets() {
+        let mut s = Settings {
+            default_user_password: "pw-row-secret".to_string(),
+            otel_exporter_otlp_headers: "authorization=hdr-row-secret".to_string(),
+            ..Settings::default()
+        };
+        s.sections
+            .insert("llm.api_key".into(), Value::from("sk-section-secret"));
+        s.sections
+            .insert("embedding_api_key".into(), Value::from("sk-alias-secret"));
+        s.sections
+            .insert("custom.api_key".into(), Value::from("sk-unknown-secret"));
+        s.sections
+            .insert("custom.enabled".into(), Value::Bool(true));
+        s.sections
+            .insert("llm.model".into(), Value::from("gpt-4o-mini"));
+
+        for out in [format!("{s:?}"), format!("{s:#?}")] {
+            for secret in [
+                "pw-row-secret",
+                "hdr-row-secret",
+                "sk-section-secret",
+                "sk-alias-secret",
+                "sk-unknown-secret",
+            ] {
+                assert!(!out.contains(secret), "{secret} leaked: {out}");
+            }
+            assert!(out.contains("gpt-4o-mini"), "non-secret shown: {out}");
+            assert!(out.contains(cognee_config_core::REDACTED), "{out}");
+        }
+        let out = format!("{s:?}");
+        assert!(out.contains("\"custom.enabled\": true"), "{out}");
+        assert!(out.contains("enable_access_control: false"), "{out}");
     }
 
     /// Every row's get/set round-trips its default value.

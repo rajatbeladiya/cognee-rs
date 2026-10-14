@@ -29,7 +29,7 @@ pub const SECRET_FIELDS: &[&str] = &[
     "otel_exporter_otlp_headers",
 ];
 
-const REDACTED: &str = "***REDACTED***";
+use cognee::config::REDACTED;
 
 /// The configuration a binding's `get()` returns: every `Settings` field and
 /// every setting of every known component section (canonical key, current or

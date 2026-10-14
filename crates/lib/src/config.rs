@@ -15,7 +15,9 @@ use serde::{Deserialize, Serialize};
 pub use cognee_config_core::{EnvSource, MapEnv};
 
 mod keys;
-pub use cognee_config_core::{ConfigSchema, ConfigSection, ConfigValues, KeyDef, SectionSchema};
+pub use cognee_config_core::{
+    ConfigSchema, ConfigSection, ConfigValues, KeyDef, REDACTED, SectionSchema,
+};
 pub use keys::{KeySpec, builtin_schema, key_spec, keys, schema_with};
 
 pub const DEFAULT_SYSTEM_PROMPT_PATH: &str = "answer_simple_question.txt";
@@ -120,7 +122,9 @@ fn sslmode_from_connect_args(raw: &str) -> Option<String> {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// `Debug` is hand-written (in `config/keys.rs`) so that `{:?}` never prints a
+/// credential: see the `impl Debug for Settings` there.
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     pub default_user_id: String,

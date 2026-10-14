@@ -201,6 +201,52 @@ impl<T: ConfigValue> ConfigValue for Option<T> {
     }
 }
 
+/// The marker that stands in for a secret value wherever configuration is
+/// shown: the masked snapshot a binding's `config.get()` returns, and the
+/// `Debug` output of a [`config_section!`](crate::config_section) struct.
+pub const REDACTED: &str = "***REDACTED***";
+
+/// `Debug`-formats a secret value without revealing it.
+///
+/// An unset value (one whose JSON form is `null`, i.e. an `Option` that is
+/// `None`) prints as `None`; any other value prints as the bare [`REDACTED`]
+/// marker, an empty string included, so the output reveals only whether the
+/// secret is set. This is the rule [`ConfigSchema::snapshot`] masks by.
+///
+/// ```
+/// use cognee_config_core::{REDACTED, Redacted};
+///
+/// assert_eq!(format!("{:?}", Redacted(&"sk-live".to_string())), REDACTED);
+/// assert_eq!(format!("{:?}", Redacted(&Some("sk-live".to_string()))), REDACTED);
+/// assert_eq!(format!("{:?}", Redacted(&None::<String>)), "None");
+/// ```
+pub struct Redacted<'a, T: ?Sized>(pub &'a T);
+
+impl<T: ConfigValue> std::fmt::Debug for Redacted<'_, T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.0.to_json().is_null() {
+            f.write_str("None")
+        } else {
+            f.write_str(REDACTED)
+        }
+    }
+}
+
+/// The `Debug` of one [`config_section!`](crate::config_section) field: the
+/// field's own `Debug` when it is not a secret, [`Redacted`] when it is.
+#[doc(hidden)]
+pub struct SectionFieldDebug<'a, T>(pub &'a T, pub bool);
+
+impl<T: ConfigValue + std::fmt::Debug> std::fmt::Debug for SectionFieldDebug<'_, T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.1 {
+            std::fmt::Debug::fmt(&Redacted(self.0), f)
+        } else {
+            std::fmt::Debug::fmt(self.0, f)
+        }
+    }
+}
+
 /// One setting of a section.
 #[derive(Debug)]
 pub struct KeyDef {
@@ -610,7 +656,12 @@ impl ConfigSchema {
 /// Each field becomes the setting `"<section>.<field>"`, bound to `env` (in
 /// priority order) and reachable under each `alias` (use the Python SDK's flat
 /// name where there is one). The field type must implement
-/// [`ConfigValue`](crate::ConfigValue).
+/// [`ConfigValue`](crate::ConfigValue) and `Debug`.
+///
+/// The struct derives `Clone` and `PartialEq` and gets a hand-written `Debug`
+/// that never prints a `secret: true` field: such a field shows as the
+/// [`REDACTED`](crate::REDACTED) marker when set and as `None` when unset (see
+/// [`Redacted`](crate::Redacted)), so `{:?}` of a section is safe to log.
 #[macro_export]
 macro_rules! config_section {
     (
@@ -627,12 +678,26 @@ macro_rules! config_section {
         }
     ) => {
         $(#[doc = $sdoc])*
-        #[derive(Debug, Clone, PartialEq)]
+        #[derive(Clone, PartialEq)]
         $vis struct $name {
             $(
                 $(#[doc = $doc])*
                 $fvis $field: $ty,
             )*
+        }
+
+        // Hand-written so a secret field never reaches a log line.
+        impl ::core::fmt::Debug for $name {
+            fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+                f.debug_struct(stringify!($name))
+                    $(
+                        .field(
+                            stringify!($field),
+                            &$crate::SectionFieldDebug(&self.$field, $secret),
+                        )
+                    )*
+                    .finish()
+            }
         }
 
         impl ::core::default::Default for $name {
@@ -730,6 +795,37 @@ mod tests {
         let mut schema = ConfigSchema::new();
         schema.add(Demo::schema()).unwrap();
         schema
+    }
+
+    /// `{:?}` of a section never prints a secret: a set secret shows as the
+    /// marker, an unset one as `None`, and non-secret fields as usual.
+    #[test]
+    fn section_debug_redacts_secrets() {
+        let demo = Demo {
+            size: 9,
+            token: Some("sk-super-secret-value".to_string()),
+            flag: true,
+        };
+        for out in [format!("{demo:?}"), format!("{demo:#?}")] {
+            assert!(!out.contains("sk-super-secret-value"), "{out}");
+            assert!(out.contains(REDACTED), "{out}");
+            assert!(out.contains("size: 9"), "{out}");
+            assert!(out.contains("flag: true"), "{out}");
+        }
+        assert_eq!(
+            format!("{demo:?}"),
+            "Demo { size: 9, token: ***REDACTED***, flag: true }"
+        );
+        assert_eq!(
+            format!("{:?}", Demo::default()),
+            "Demo { size: 7, token: None, flag: false }"
+        );
+        // An empty secret is masked too: the output only tells it is set.
+        let empty = Demo {
+            token: Some(String::new()),
+            ..Demo::default()
+        };
+        assert!(format!("{empty:?}").contains(REDACTED));
     }
 
     #[test]

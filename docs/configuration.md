@@ -137,7 +137,18 @@ as `embedding_model`); those are applied as the setting they name, not treated a
 unknown.
 
 A setting marked `secret` (a registry row or a section key) is masked as
-`***REDACTED***` in every binding's `config.get()` output.
+`***REDACTED***` (`cognee_config_core::REDACTED`) in every binding's
+`config.get()` output. It is masked in `Debug` output too, so `{:?}` of a
+configuration is safe to log:
+
+* a `config_section!` struct prints a set secret field as `***REDACTED***` and an
+  unset one (an `Option` that is `None`) as `None`; other fields print as usual;
+* `Settings` prints every setting as JSON, masking secret rows and secret section
+  keys the same way. A `sections` entry no built-in section owns (a custom
+  registry's, or a stale one) is masked unless it is a boolean or a number,
+  because only its owner knows whether it is a credential;
+* `LlmConfig` and `EmbeddingConfig` mask their API keys; `AwsInputs` masks its
+  credentials.
 
 ### How the rule is enforced
 
