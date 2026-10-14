@@ -253,13 +253,28 @@ macro_rules! row {
 
 use kind::{as_bool, as_string};
 
-/// Why `enable_access_control` / `ENABLE_BACKEND_ACCESS_CONTROL` cannot be
-/// `true`.
-const ACCESS_CONTROL_UNSUPPORTED: &str = "backend access control is not available from \
-     configuration in cognee-rs: it requires an AclDb supplied by the embedding \
-     application (SearchBuilder/SearchOrchestrator::with_acl_db, the ingestion \
-     builder's with_acl_db, DatasetManager::with_acl). Unset \
+/// The setting key of backend access control.
+pub(super) const ACCESS_CONTROL_KEY: &str = "enable_access_control";
+/// Its env var, the Python SDK's name.
+const ACCESS_CONTROL_ENV: &[&str] = &["ENABLE_BACKEND_ACCESS_CONTROL"];
+
+/// Why `enable_access_control = true` is refused when the application has not
+/// declared that it provides access control.
+const ACCESS_CONTROL_NOT_PROVIDED: &str = "cognee-rs does not enforce backend access \
+     control from configuration: it applies only when the embedding application supplies \
+     an AclDb (SearchBuilder/SearchOrchestrator::with_acl_db, the ingestion builder's \
+     with_acl_db, DatasetManager::with_acl), and this application has not declared that \
+     it does (ConfigManager::set_application_access_control). Unset \
      ENABLE_BACKEND_ACCESS_CONTROL / enable_access_control or set it to false";
+
+/// The error for `enable_access_control = true` without an application that
+/// provides access control.
+pub(super) fn access_control_not_provided() -> ConfigError {
+    ConfigError::Unsupported {
+        key: ACCESS_CONTROL_KEY.to_string(),
+        reason: ACCESS_CONTROL_NOT_PROVIDED.to_string(),
+    }
+}
 
 /// The registry. Field order follows `Settings`.
 static KEYS: &[KeySpec] = &[
@@ -339,27 +354,26 @@ static KEYS: &[KeySpec] = &[
     // -- Authentication / ACL -----------------------------------------------
     row!(default_user_email: str, env ["DEFAULT_USER_EMAIL"]),
     row!(default_user_password: str secret, env ["DEFAULT_USER_PASSWORD"]),
-    // Reserved, not acted on: kept so the Python SDK's env var stays a known
-    // setting (Python-parity configs carry `ENABLE_BACKEND_ACCESS_CONTROL=false`),
-    // but `true` is rejected. `set` refuses it at once; a `true` from env or a
-    // loaded config is stored so `ConfigManager::check_strict` reports it at
-    // first use.
+    // Reserved: cognee-rs itself never acts on it. It stays a known setting so
+    // the Python SDK's env var is not an unknown key (Python-parity configs
+    // carry `ENABLE_BACKEND_ACCESS_CONTROL=false`), but `true` is accepted only
+    // when the application declares that it provides access control
+    // (`ConfigManager::set_application_access_control`). This row's plain
+    // `set` cannot know that, so it refuses `true`; `ConfigManager::set` lets
+    // it through for such an application. A `true` from env or a loaded
+    // config is stored, and `ConfigManager::check_supported` reports it.
     KeySpec {
-        key: "enable_access_control",
+        key: ACCESS_CONTROL_KEY,
         key_aliases: &[],
-        env: &["ENABLE_BACKEND_ACCESS_CONTROL"],
+        env: ACCESS_CONTROL_ENV,
         secret: false,
         persisted: true,
         overlay: |s, env| {
-            kind::overlay_bool(
-                &mut s.enable_access_control,
-                env,
-                &["ENABLE_BACKEND_ACCESS_CONTROL"],
-            );
+            kind::overlay_bool(&mut s.enable_access_control, env, ACCESS_CONTROL_ENV);
         },
         set: |s, key, v| {
             if as_bool(key, &v)? {
-                return Err(mismatch(key, ACCESS_CONTROL_UNSUPPORTED));
+                return Err(access_control_not_provided());
             }
             s.enable_access_control = false;
             Ok(())
@@ -492,19 +506,19 @@ impl Settings {
 
     /// Fail if a setting holds a value cognee-rust accepts as a key but does
     /// not support. Today that is `enable_access_control = true`
-    /// (`ENABLE_BACKEND_ACCESS_CONTROL`): backend access control is wired only
-    /// by an application that attaches its own `AclDb`, so a configuration
-    /// asking for it is an error rather than a silently inert flag. `false`
-    /// (the default) is accepted.
+    /// (`ENABLE_BACKEND_ACCESS_CONTROL`) when `application_access_control` is
+    /// `false`: cognee-rs applies dataset ACLs only through an `AclDb` the
+    /// embedding application attaches, so a configuration asking for access
+    /// control is an error unless the application declares that it provides
+    /// it. `false` (the default) is always accepted.
     ///
-    /// [`ConfigManager::check_strict`](super::ConfigManager::check_strict)
-    /// runs this regardless of `strict_config`.
-    pub fn check_supported(&self) -> Result<(), ConfigError> {
-        if self.enable_access_control {
-            return Err(mismatch(
-                "enable_access_control",
-                ACCESS_CONTROL_UNSUPPORTED,
-            ));
+    /// [`ConfigManager::check_supported`](super::ConfigManager::check_supported)
+    /// calls this with the manager's
+    /// [`application_access_control`](super::ConfigManager::application_access_control)
+    /// switch.
+    pub fn check_supported(&self, application_access_control: bool) -> Result<(), ConfigError> {
+        if self.enable_access_control && !application_access_control {
+            return Err(access_control_not_provided());
         }
         Ok(())
     }
@@ -693,30 +707,40 @@ mod tests {
 
     fn assert_access_control_rejected(result: Result<(), ConfigError>) {
         match result {
-            Err(ConfigError::TypeMismatch { key, reason }) => {
+            Err(ConfigError::Unsupported { key, reason }) => {
                 assert_eq!(key, "enable_access_control");
                 assert!(reason.contains("AclDb"), "{reason}");
+                assert!(
+                    reason.contains("set_application_access_control"),
+                    "{reason}"
+                );
                 assert!(reason.contains("ENABLE_BACKEND_ACCESS_CONTROL"), "{reason}");
             }
             other => panic!("expected the access-control rejection, got {other:?}"),
         }
     }
 
+    fn env_settings(raw: &str) -> Settings {
+        let mut s = Settings::default();
+        s.overlay_from(&crate::config::MapEnv::new().with("ENABLE_BACKEND_ACCESS_CONTROL", raw));
+        s
+    }
+
     /// `ENABLE_BACKEND_ACCESS_CONTROL=true` is an error at first use, without
     /// `strict_config`; `false` and unset are accepted.
     #[test]
     fn access_control_from_env_true_is_rejected() {
-        use crate::config::{ConfigManager, MapEnv};
+        use crate::config::ConfigManager;
         for raw in ["true", "1", "yes", "ON"] {
-            let mut s = Settings::default();
-            s.overlay_from(&MapEnv::new().with("ENABLE_BACKEND_ACCESS_CONTROL", raw));
+            let s = env_settings(raw);
             assert!(!s.strict_config);
-            assert_access_control_rejected(s.check_supported());
-            assert_access_control_rejected(ConfigManager::new(s).check_strict());
+            assert_access_control_rejected(s.check_supported(false));
+            let cm = ConfigManager::new(s);
+            assert_access_control_rejected(cm.check_supported());
+            assert_access_control_rejected(cm.check_strict());
         }
         for raw in ["false", "0", "no", ""] {
-            let mut s = Settings::default();
-            s.overlay_from(&MapEnv::new().with("ENABLE_BACKEND_ACCESS_CONTROL", raw));
+            let s = env_settings(raw);
             assert!(!s.enable_access_control, "{raw:?}");
             ConfigManager::new(s).check_strict().unwrap();
         }
@@ -764,6 +788,67 @@ mod tests {
         let patch = serde_json::json!({ "enable_access_control": false });
         cm.apply_patch(patch.as_object().unwrap()).unwrap();
         cm.check_strict().unwrap();
+    }
+
+    /// An application that provides access control owns the flag: `true` is
+    /// accepted from env, `set`, `apply_patch` and a loaded config, and can
+    /// be turned off again.
+    #[test]
+    fn access_control_true_is_accepted_when_the_application_provides_it() {
+        use crate::config::ConfigManager;
+        let cm = ConfigManager::new(env_settings("true"));
+        assert_access_control_rejected(cm.check_strict());
+        cm.set_application_access_control(true);
+        assert!(cm.application_access_control());
+        cm.check_strict().unwrap();
+        cm.check_supported().unwrap();
+        assert!(cm.read().enable_access_control);
+        // Shared by clones.
+        assert!(cm.clone().application_access_control());
+
+        let cm = ConfigManager::new(Settings::default());
+        cm.set_application_access_control(true);
+        cm.set("enable_access_control", Value::Bool(true)).unwrap();
+        assert_eq!(cm.get("enable_access_control"), Some(Value::Bool(true)));
+        cm.set("enable_access_control", Value::Bool(false)).unwrap();
+        let patch = serde_json::json!({ "enable_access_control": true });
+        cm.apply_patch(patch.as_object().unwrap()).unwrap();
+        assert!(cm.read().enable_access_control);
+        cm.check_strict().unwrap();
+        assert!(matches!(
+            cm.set("enable_access_control", Value::from("yes")),
+            Err(ConfigError::TypeMismatch { .. })
+        ));
+
+        // Withdrawn again: the stored `true` is reported.
+        cm.set_application_access_control(false);
+        assert_access_control_rejected(cm.check_strict());
+    }
+
+    /// `apply_patch` is atomic: a failing key leaves every other key of the
+    /// patch unapplied and the version unchanged.
+    #[test]
+    fn apply_patch_is_atomic() {
+        use crate::config::ConfigManager;
+        let cm = ConfigManager::new(Settings::default());
+        let before = cm.read().chunk_overlap;
+        let patch = serde_json::json!({
+            "chunk_overlap": before + 7,
+            "llm.model": "patched-model",
+            "custom.unknown": 1,
+            "enable_access_control": true,
+        });
+        assert_access_control_rejected(cm.apply_patch(patch.as_object().unwrap()));
+        assert_eq!(cm.version(), 0);
+        assert_eq!(cm.read().chunk_overlap, before);
+        assert_ne!(cm.read().llm().model, "patched-model");
+        assert!(!cm.read().sections.contains_key("custom.unknown"));
+
+        let patch = serde_json::json!({ "chunk_overlap": before + 7, "llm.model": "m" });
+        cm.apply_patch(patch.as_object().unwrap()).unwrap();
+        assert_eq!(cm.version(), 1, "one bump per patch");
+        assert_eq!(cm.read().chunk_overlap, before + 7);
+        assert_eq!(cm.read().llm().model, "m");
     }
 
     /// `{:?}` of `Settings` never prints a credential: a secret row, a

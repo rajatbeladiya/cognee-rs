@@ -5642,7 +5642,7 @@
     "key": "enable_access_control"
   },
   "enable_access_control <- true": {
-    "err": "TypeMismatch",
+    "err": "Unsupported",
     "key": "enable_access_control"
   },
   "enable_access_control <- {\"a\":1}": {

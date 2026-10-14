@@ -1432,30 +1432,50 @@ themselves get the configured backend from
 | `COGNEE_DEFAULT_USER_ID` | `default_user_id` | nil UUID |
 | `COGNEE_DEFAULT_DATASET_NAME` | `default_dataset_name` | `main_dataset` |
 | `DEFAULT_USER_EMAIL` / `DEFAULT_USER_PASSWORD` | … | `default_user@example.com` / _(empty)_ |
-| `ENABLE_BACKEND_ACCESS_CONTROL` | `enable_access_control` | `false`; `true` is rejected (below) |
+| `ENABLE_BACKEND_ACCESS_CONTROL` | `enable_access_control` | `false`; `true` only with application-provided access control (below) |
 
 Setting `system_root_directory` cascades to the default `graph_file_path` and
 `vector_db_url` unless those are set explicitly.
 
-**`ENABLE_BACKEND_ACCESS_CONTROL` / `enable_access_control` is reserved and only
-`false` is accepted.** cognee-rust has no configuration-driven access control:
-dataset ACLs apply only when the embedding application attaches its own `AclDb`
+**`ENABLE_BACKEND_ACCESS_CONTROL` / `enable_access_control` is reserved.**
+cognee-rust never enforces access control from configuration: dataset ACLs
+apply only when the embedding application attaches its own `AclDb`
 (`SearchBuilder` / `SearchOrchestrator::with_acl_db`, the ingestion builder's
-`with_acl_db`, `DatasetManager::with_acl`). So instead of accepting a flag that
-would change nothing, `true` is a configuration error, whatever
-`strict_config` says. The key stays known, so a Python-parity configuration
-carrying `ENABLE_BACKEND_ACCESS_CONTROL=false` (or leaving it unset) loads
-without a warning. Python defaults the flag to `true`; this is a deliberate
-divergence.
+`with_acl_db`, `DatasetManager::with_acl`). So by default `true` is a
+configuration error (`ConfigError::Unsupported`), whatever `strict_config` says,
+instead of a flag that would silently change nothing. `false` and unset are
+always accepted, and the key stays known, so a Python-parity configuration
+carrying `ENABLE_BACKEND_ACCESS_CONTROL=false` loads without a warning. Python
+defaults the flag to `true`; this is a deliberate divergence.
 
 * `ConfigManager::set` / `Settings::set_key`, every binding's `set`, a binding's
-  constructor settings object and `cognee-cli config set` fail at once with a
-  `TypeMismatch` for `enable_access_control` whose reason explains the above.
+  constructor settings object (`apply_patch`, which is atomic: nothing of a
+  failing patch is applied) and `cognee-cli config set` fail at once.
 * A `true` from the environment or a loaded config file is kept and reported by
-  `ConfigManager::check_strict` (`Settings::check_supported`) at first use: the
-  CLI command, or the handle's first operation. `cognee-cli config set
+  `ConfigManager::check_supported`: from `ConfigManager::check_strict` (the CLI
+  command, a binding handle's first operation) and before every component
+  build of a `ComponentManager`, so a Rust SDK user who never calls
+  `check_strict` cannot run with it either. `cognee-cli config set
   enable_access_control false` or `config unset enable_access_control` repairs a
   saved config.
+* Bindings report it with their existing "unsupported" error: C
+  `CG_ERR_UNSUPPORTED`, Python `CogneeUnsupportedError`, TS/Java `UNSUPPORTED`.
+
+**An application that provides access control owns the flag.** It declares so on
+its `ConfigManager` before the configuration is validated:
+
+```rust
+let config = ConfigManager::from_env_with_schema(&registry.config_schema()?)?;
+config.set_application_access_control(true);
+config.check_strict()?; // `ENABLE_BACKEND_ACCESS_CONTROL=true` is accepted now
+let acl_on = config.read().enable_access_control; // the application acts on it
+```
+
+A binding handle does the same with
+`HandleState::with_application_access_control()`. The switch is shared by every
+clone of the manager. With it, `true` is accepted from env, config files, `set`
+and `apply_patch`; reading the value and attaching the `AclDb` remain the
+application's job.
 
 ## Session / cache & rate limiting
 
