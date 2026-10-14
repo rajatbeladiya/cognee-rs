@@ -138,17 +138,33 @@ unknown.
 
 A setting marked `secret` (a registry row or a section key) is masked as
 `***REDACTED***` (`cognee_config_core::REDACTED`) in every binding's
-`config.get()` output. It is masked in `Debug` output too, so `{:?}` of a
-configuration is safe to log:
+`config.get()` output when it is set. An unset secret (`null`, or `""` for a
+string-typed one) is shown as itself: its emptiness reveals nothing, and the
+marker would claim it is set (`cognee_config_core::secret_is_set` /
+`mask_secret`).
+
+`Debug` output follows the same rule, so `{:?}` of a configuration does not
+print credentials:
 
 * a `config_section!` struct prints a set secret field as `***REDACTED***` and an
-  unset one (an `Option` that is `None`) as `None`; other fields print as usual;
-* `Settings` prints every setting as JSON, masking secret rows and secret section
-  keys the same way. A `sections` entry no built-in section owns (a custom
-  registry's, or a stale one) is masked unless it is a boolean or a number,
-  because only its owner knows whether it is a credential;
-* `LlmConfig` and `EmbeddingConfig` mask their API keys; `AwsInputs` masks its
-  credentials.
+  unset one as itself (`None`, `""`). Every other field prints its own `Debug`
+  with embedded credentials masked (`cognee_config_core::redact_credentials`):
+  the password of a URL (`postgres://cognee:***REDACTED***@db/cognee`) and the
+  value of a password-like `key=value` pair (a query parameter such as
+  `sslpassword=`, or a libpq keyword DSN such as `host=db password=…`). This
+  covers the connection URLs (`relational.url` / `DATABASE_URL`,
+  `relational.migration_url`, `vector.url`, `graph.url`), which are not marked
+  `secret` because they are mostly not credentials;
+* `Settings` prints every setting as JSON with the same masking. A `sections`
+  entry no built-in section owns (a custom registry's, or a stale one) is
+  masked when it is a non-empty string, because only its owner knows whether it
+  is a credential. Formatting has no side effects: it consults the built-in
+  schema only once something else has built it;
+* `LlmConfig` and `EmbeddingConfig` mask their API keys and their endpoint's
+  credentials; `AwsInputs` / `AwsSettings` mask their credentials.
+
+The masking is best effort for the shapes above; a credential in a free-form
+value of some other shape is not recognised.
 
 ### How the rule is enforced
 

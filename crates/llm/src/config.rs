@@ -69,25 +69,39 @@ pub struct LlmConfig {
 
 impl std::fmt::Debug for LlmConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        use cognee_config_core::Redacted;
+        use cognee_config_core::{CredentialSafe, Redacted};
+        // Exhaustive: a new field fails to compile until it is shown here.
+        let Self {
+            provider,
+            model,
+            api_key,
+            endpoint,
+            temperature,
+            max_tokens,
+            streaming,
+            timeout_seconds,
+            max_retries,
+            rate_limit_enabled,
+            rate_limit_requests,
+            rate_limit_interval_seconds,
+            fallback_model,
+            fallback_api_key,
+        } = self;
         f.debug_struct("LlmConfig")
-            .field("provider", &self.provider)
-            .field("model", &self.model)
-            .field("api_key", &Redacted(&self.api_key))
-            .field("endpoint", &self.endpoint)
-            .field("temperature", &self.temperature)
-            .field("max_tokens", &self.max_tokens)
-            .field("streaming", &self.streaming)
-            .field("timeout_seconds", &self.timeout_seconds)
-            .field("max_retries", &self.max_retries)
-            .field("rate_limit_enabled", &self.rate_limit_enabled)
-            .field("rate_limit_requests", &self.rate_limit_requests)
-            .field(
-                "rate_limit_interval_seconds",
-                &self.rate_limit_interval_seconds,
-            )
-            .field("fallback_model", &self.fallback_model)
-            .field("fallback_api_key", &Redacted(&self.fallback_api_key))
+            .field("provider", provider)
+            .field("model", model)
+            .field("api_key", &Redacted(api_key))
+            .field("endpoint", &CredentialSafe(endpoint))
+            .field("temperature", temperature)
+            .field("max_tokens", max_tokens)
+            .field("streaming", streaming)
+            .field("timeout_seconds", timeout_seconds)
+            .field("max_retries", max_retries)
+            .field("rate_limit_enabled", rate_limit_enabled)
+            .field("rate_limit_requests", rate_limit_requests)
+            .field("rate_limit_interval_seconds", rate_limit_interval_seconds)
+            .field("fallback_model", fallback_model)
+            .field("fallback_api_key", &Redacted(fallback_api_key))
             .finish()
     }
 }

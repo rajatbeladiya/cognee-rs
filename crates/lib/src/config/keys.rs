@@ -436,6 +436,10 @@ static KEYS: &[KeySpec] = &[
     },
 ];
 
+/// [`builtin_schema`], once something has built it. `Settings`' `Debug` reads
+/// it with `get()`, so formatting never builds the component registry.
+static BUILTIN_SCHEMA: OnceLock<ConfigSchema> = OnceLock::new();
+
 /// The configuration schema of a default build: the `Settings` keys and env
 /// vars reserved, plus the sections of every factory
 /// `ComponentRegistry::with_builtins()` registers for the enabled features.
@@ -444,8 +448,7 @@ static KEYS: &[KeySpec] = &[
 /// with [`ConfigManager::extend_schema`](super::ConfigManager::extend_schema)
 /// (which `ComponentManager::with_registry` does).
 pub fn builtin_schema() -> &'static ConfigSchema {
-    static SCHEMA: OnceLock<ConfigSchema> = OnceLock::new();
-    SCHEMA.get_or_init(|| {
+    BUILTIN_SCHEMA.get_or_init(|| {
         let mut schema = core_schema();
         let builtins = cognee_components::ComponentRegistry::with_builtins()
             .config_schema()
@@ -573,9 +576,10 @@ impl Settings {
     }
 }
 
-/// One value of [`Settings`]' `Debug` output: compact JSON, or the
-/// [`REDACTED`](cognee_config_core::REDACTED) marker for a non-null secret
-/// (an empty one too, so the output reveals only that it is set).
+/// One value of [`Settings`]' `Debug` output, as compact JSON: a secret by
+/// [`mask_secret`](cognee_config_core::mask_secret) (the marker when set,
+/// itself when `null` or `""`), any other value with embedded credentials
+/// masked by [`redact_credentials`](cognee_config_core::redact_credentials).
 struct ShownValue<'a> {
     value: &'a Value,
     secret: bool,
@@ -583,11 +587,11 @@ struct ShownValue<'a> {
 
 impl std::fmt::Debug for ShownValue<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.secret && !self.value.is_null() {
-            f.write_str(cognee_config_core::REDACTED)
-        } else {
-            write!(f, "{}", self.value)
+        if self.secret && cognee_config_core::secret_is_set(self.value) {
+            return f.write_str(cognee_config_core::REDACTED);
         }
+        let json = self.value.to_string();
+        f.write_str(&cognee_config_core::redact_credentials(&json))
     }
 }
 
@@ -596,17 +600,18 @@ struct ShownSections<'a>(&'a cognee_config_core::ConfigValues);
 
 impl std::fmt::Debug for ShownSections<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let schema = builtin_schema();
+        // Only an already built schema: building it here would construct the
+        // component registry inside a formatter.
+        let schema = BUILTIN_SCHEMA.get();
         let mut map = f.debug_map();
         for (key, value) in self.0 {
             // A key of a built-in section (or an alias of one) is masked by its
-            // `secret` flag. A key no built-in section owns belongs to a
-            // section a custom registry adds (or is stale), so whether it is a
-            // credential is unknown here: its value is masked unless it is a
-            // boolean or a number.
-            let secret = match schema.key_def(key) {
+            // `secret` flag. A key no built-in section owns (a custom
+            // registry's, a stale one, or any key before the built-in schema
+            // exists) may be a credential: a string is masked unless empty.
+            let secret = match schema.and_then(|schema| schema.key_def(key)) {
                 Some(def) => def.secret,
-                None => !(value.is_boolean() || value.is_number()),
+                None => value.is_string(),
             };
             map.entry(&key, &ShownValue { value, secret });
         }
@@ -614,11 +619,13 @@ impl std::fmt::Debug for ShownSections<'_> {
     }
 }
 
-/// Never prints a credential: every setting is shown as JSON, and a setting
-/// marked `secret` (a registry row, or a section key) is replaced by
-/// [`REDACTED`](cognee_config_core::REDACTED). A `sections` entry that no
-/// built-in section owns is masked too unless it is a boolean or a number,
-/// since only the registry that owns it knows whether it is a secret.
+/// Never prints a credential, and has no side effects: every setting is shown
+/// as JSON; a setting marked `secret` (a registry row, or a built-in section
+/// key) shows as [`REDACTED`](cognee_config_core::REDACTED) when set and as its
+/// `null` / `""` otherwise; any other value has embedded credentials (a URL
+/// password, `password=…`) masked. A `sections` entry no built-in section owns
+/// is masked when it is a non-empty string, since only the registry that owns
+/// it knows whether it is a secret.
 impl std::fmt::Debug for Settings {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut out = f.debug_struct("Settings");
@@ -871,6 +878,17 @@ mod tests {
             .insert("custom.enabled".into(), Value::Bool(true));
         s.sections
             .insert("llm.model".into(), Value::from("gpt-4o-mini"));
+        // Not secrets, but they embed one.
+        s.sections.insert(
+            "relational.url".into(),
+            Value::from("postgres://cognee:url-pw-secret@db:5432/cognee"),
+        );
+        s.sections.insert(
+            "graph.url".into(),
+            Value::from("host=db user=cognee password=dsn-pw-secret dbname=g"),
+        );
+        // Only an already built schema is consulted by `Debug`.
+        let _ = builtin_schema();
 
         for out in [format!("{s:?}"), format!("{s:#?}")] {
             for secret in [
@@ -879,6 +897,8 @@ mod tests {
                 "sk-section-secret",
                 "sk-alias-secret",
                 "sk-unknown-secret",
+                "url-pw-secret",
+                "dsn-pw-secret",
             ] {
                 assert!(!out.contains(secret), "{secret} leaked: {out}");
             }
@@ -888,6 +908,14 @@ mod tests {
         let out = format!("{s:?}");
         assert!(out.contains("\"custom.enabled\": true"), "{out}");
         assert!(out.contains("enable_access_control: false"), "{out}");
+        assert!(
+            out.contains("postgres://cognee:***REDACTED***@db:5432/cognee"),
+            "{out}"
+        );
+        // An unset (empty) string secret shows as itself, not as the marker.
+        let out = format!("{:?}", Settings::default());
+        assert!(out.contains("default_user_password: \"\""), "{out}");
+        assert!(!out.contains(cognee_config_core::REDACTED), "{out}");
     }
 
     /// Every row's get/set round-trips its default value.

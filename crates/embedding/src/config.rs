@@ -363,23 +363,42 @@ pub struct EmbeddingConfig {
 
 impl std::fmt::Debug for EmbeddingConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use cognee_config_core::{CredentialSafe, Redacted};
+        // Exhaustive: a new field fails to compile until it is shown here.
+        let Self {
+            provider,
+            model,
+            dimensions,
+            endpoint,
+            api_key,
+            api_version,
+            max_completion_tokens,
+            batch_size,
+            mock,
+            mock_mode,
+            #[cfg(feature = "onnx")]
+            onnx,
+            huggingface_tokenizer,
+            #[cfg(feature = "bedrock")]
+            aws,
+        } = self;
         let mut out = f.debug_struct("EmbeddingConfig");
-        out.field("provider", &self.provider)
-            .field("model", &self.model)
-            .field("dimensions", &self.dimensions)
-            .field("endpoint", &self.endpoint)
-            .field("api_key", &cognee_config_core::Redacted(&self.api_key))
-            .field("api_version", &self.api_version)
-            .field("max_completion_tokens", &self.max_completion_tokens)
-            .field("batch_size", &self.batch_size)
-            .field("mock", &self.mock)
-            .field("mock_mode", &self.mock_mode);
+        out.field("provider", provider)
+            .field("model", model)
+            .field("dimensions", dimensions)
+            .field("endpoint", &CredentialSafe(endpoint))
+            .field("api_key", &Redacted(api_key))
+            .field("api_version", api_version)
+            .field("max_completion_tokens", max_completion_tokens)
+            .field("batch_size", batch_size)
+            .field("mock", mock)
+            .field("mock_mode", mock_mode);
         #[cfg(feature = "onnx")]
-        out.field("onnx", &self.onnx);
-        out.field("huggingface_tokenizer", &self.huggingface_tokenizer);
+        out.field("onnx", onnx);
+        out.field("huggingface_tokenizer", huggingface_tokenizer);
         // `AwsInputs`' own `Debug` redacts its secrets.
         #[cfg(feature = "bedrock")]
-        out.field("aws", &self.aws);
+        out.field("aws", aws);
         out.finish()
     }
 }

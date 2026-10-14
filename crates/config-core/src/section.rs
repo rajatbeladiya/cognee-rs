@@ -201,48 +201,19 @@ impl<T: ConfigValue> ConfigValue for Option<T> {
     }
 }
 
-/// The marker that stands in for a secret value wherever configuration is
-/// shown: the masked snapshot a binding's `config.get()` returns, and the
-/// `Debug` output of a [`config_section!`](crate::config_section) struct.
-pub const REDACTED: &str = "***REDACTED***";
-
-/// `Debug`-formats a secret value without revealing it.
-///
-/// An unset value (one whose JSON form is `null`, i.e. an `Option` that is
-/// `None`) prints as `None`; any other value prints as the bare [`REDACTED`]
-/// marker, an empty string included, so the output reveals only whether the
-/// secret is set. This is the rule [`ConfigSchema::snapshot`] masks by.
-///
-/// ```
-/// use cognee_config_core::{REDACTED, Redacted};
-///
-/// assert_eq!(format!("{:?}", Redacted(&"sk-live".to_string())), REDACTED);
-/// assert_eq!(format!("{:?}", Redacted(&Some("sk-live".to_string()))), REDACTED);
-/// assert_eq!(format!("{:?}", Redacted(&None::<String>)), "None");
-/// ```
-pub struct Redacted<'a, T: ?Sized>(pub &'a T);
-
-impl<T: ConfigValue> std::fmt::Debug for Redacted<'_, T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.0.to_json().is_null() {
-            f.write_str("None")
-        } else {
-            f.write_str(REDACTED)
-        }
-    }
-}
-
-/// The `Debug` of one [`config_section!`](crate::config_section) field: the
-/// field's own `Debug` when it is not a secret, [`Redacted`] when it is.
+/// The `Debug` of one [`config_section!`](crate::config_section) field:
+/// [`Redacted`](crate::Redacted) when it is a secret, otherwise its own `Debug`
+/// with any embedded credential (a URL password, `password=…`) masked by
+/// [`CredentialSafe`](crate::CredentialSafe).
 #[doc(hidden)]
 pub struct SectionFieldDebug<'a, T>(pub &'a T, pub bool);
 
 impl<T: ConfigValue + std::fmt::Debug> std::fmt::Debug for SectionFieldDebug<'_, T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.1 {
-            std::fmt::Debug::fmt(&Redacted(self.0), f)
+            std::fmt::Debug::fmt(&crate::Redacted(self.0), f)
         } else {
-            std::fmt::Debug::fmt(self.0, f)
+            std::fmt::Debug::fmt(&crate::CredentialSafe(self.0), f)
         }
     }
 }
@@ -606,16 +577,15 @@ impl ConfigSchema {
 
     /// Every registered setting with its current value (from `values`, else
     /// its default), keyed canonically. With `mask = Some(marker)`, every
-    /// non-null secret value (an empty one too, so its presence leaks
-    /// nothing) is replaced by `marker`.
+    /// secret that is set ([`secret_is_set`](crate::secret_is_set): not null
+    /// and not `""`) is replaced by `marker`; an unset one keeps its `null` or
+    /// `""`.
     pub fn snapshot(&self, values: &ConfigValues, mask: Option<&str>) -> ConfigValues {
         self.key_defs()
             .map(|def| {
                 let value = values.get(def.key).cloned().unwrap_or_else(def.default);
                 let shown = match mask {
-                    Some(marker) if def.secret && !value.is_null() => {
-                        Value::String(marker.to_string())
-                    }
+                    Some(marker) if def.secret => crate::mask_secret(value, marker),
                     _ => value,
                 };
                 (def.key.to_string(), shown)
@@ -660,8 +630,11 @@ impl ConfigSchema {
 ///
 /// The struct derives `Clone` and `PartialEq` and gets a hand-written `Debug`
 /// that never prints a `secret: true` field: such a field shows as the
-/// [`REDACTED`](crate::REDACTED) marker when set and as `None` when unset (see
-/// [`Redacted`](crate::Redacted)), so `{:?}` of a section is safe to log.
+/// [`REDACTED`](crate::REDACTED) marker when set and as its own unset value
+/// (`None`, `""`) otherwise (see [`Redacted`](crate::Redacted)). Every other
+/// field prints its own `Debug` with embedded credentials masked (see
+/// [`redact_credentials`](crate::redact_credentials)), so a connection URL
+/// such as `postgres://user:pw@host/db` shows without its password.
 #[macro_export]
 macro_rules! config_section {
     (
@@ -808,7 +781,7 @@ mod tests {
         };
         for out in [format!("{demo:?}"), format!("{demo:#?}")] {
             assert!(!out.contains("sk-super-secret-value"), "{out}");
-            assert!(out.contains(REDACTED), "{out}");
+            assert!(out.contains(crate::REDACTED), "{out}");
             assert!(out.contains("size: 9"), "{out}");
             assert!(out.contains("flag: true"), "{out}");
         }
@@ -820,12 +793,44 @@ mod tests {
             format!("{:?}", Demo::default()),
             "Demo { size: 7, token: None, flag: false }"
         );
-        // An empty secret is masked too: the output only tells it is set.
+        // An empty secret is unset: it shows as itself, not as the marker.
         let empty = Demo {
             token: Some(String::new()),
             ..Demo::default()
         };
-        assert!(format!("{empty:?}").contains(REDACTED));
+        assert_eq!(
+            format!("{empty:?}"),
+            "Demo { size: 7, token: Some(\"\"), flag: false }"
+        );
+    }
+
+    crate::config_section! {
+        /// A connection section.
+        pub struct Conn in "conn" {
+            /// Connection URL; not a secret, but may embed one.
+            pub url: String = String::new() => { env: [], alias: [], secret: false },
+            /// Password.
+            pub password: String = String::new() => { env: [], alias: [], secret: true },
+        }
+    }
+
+    /// A non-secret field that embeds a credential (a connection URL) shows
+    /// without it; an unset string secret shows as `""`.
+    #[test]
+    fn section_debug_masks_credentials_in_urls() {
+        let conn = Conn {
+            url: "postgres://cognee:hunter2@db:5432/cognee?sslpassword=pw2".to_string(),
+            password: String::new(),
+        };
+        for out in [format!("{conn:?}"), format!("{conn:#?}")] {
+            assert!(!out.contains("hunter2"), "{out}");
+            assert!(!out.contains("pw2"), "{out}");
+            assert!(
+                out.contains("postgres://cognee:***REDACTED***@db:5432/cognee"),
+                "{out}"
+            );
+        }
+        assert!(format!("{conn:?}").contains("password: \"\""));
     }
 
     #[test]

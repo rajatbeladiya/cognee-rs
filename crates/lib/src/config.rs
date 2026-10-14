@@ -16,7 +16,8 @@ pub use cognee_config_core::{EnvSource, MapEnv};
 
 mod keys;
 pub use cognee_config_core::{
-    ConfigSchema, ConfigSection, ConfigValues, KeyDef, REDACTED, SectionSchema,
+    ConfigSchema, ConfigSection, ConfigValues, CredentialSafe, KeyDef, REDACTED, Redacted,
+    SectionSchema, mask_secret, redact_credentials, secret_is_set,
 };
 pub use keys::{KeySpec, builtin_schema, key_spec, keys, schema_with};
 
