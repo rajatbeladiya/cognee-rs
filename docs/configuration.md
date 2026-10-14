@@ -161,7 +161,10 @@ print credentials:
   is a credential. Formatting has no side effects: it consults the built-in
   schema only once something else has built it;
 * `LlmConfig` and `EmbeddingConfig` mask their API keys and their endpoint's
-  credentials; `AwsInputs` / `AwsSettings` mask their credentials.
+  credentials; `AwsInputs` / `AwsSettings` mask their credentials;
+* `cognee_observability::EnvSettingsView` (the process-level OTEL settings every
+  binding builds) masks its OTLP headers, like `otel_exporter_otlp_headers` in
+  `Settings`, and its endpoint's credentials.
 
 The masking is best effort for the shapes above; a credential in a free-form
 value of some other shape is not recognised.
@@ -1462,7 +1465,15 @@ configuration error (`ConfigError::Unsupported`), whatever `strict_config` says,
 instead of a flag that would silently change nothing. `false` and unset are
 always accepted, and the key stays known, so a Python-parity configuration
 carrying `ENABLE_BACKEND_ACCESS_CONTROL=false` loads without a warning. Python
-defaults the flag to `true`; this is a deliberate divergence.
+defaults the flag to `true`; this is a deliberate divergence. Every truthy
+spelling (`true`, `1`, `yes`, `on`, any case) counts as `true`.
+
+> **Migrating from Python:** Python's `.env.template` ships an uncommented
+> `ENABLE_BACKEND_ACCESS_CONTROL=True`. A `.env` copied from it (cognee-rust loads
+> `.env` automatically) makes every CLI command, every binding operation and
+> every `ComponentManager` component build fail until that line is changed to
+> `False` or removed. `cognee-cli config unset` cannot override a value that
+> comes from the environment.
 
 * `ConfigManager::set` / `Settings::set_key`, every binding's `set`, a binding's
   constructor settings object (`apply_patch`, which is atomic: nothing of a
