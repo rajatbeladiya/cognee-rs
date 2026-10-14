@@ -253,6 +253,14 @@ macro_rules! row {
 
 use kind::{as_bool, as_string};
 
+/// Why `enable_access_control` / `ENABLE_BACKEND_ACCESS_CONTROL` cannot be
+/// `true`.
+const ACCESS_CONTROL_UNSUPPORTED: &str = "backend access control is not available from \
+     configuration in cognee-rs: it requires an AclDb supplied by the embedding \
+     application (SearchBuilder/SearchOrchestrator::with_acl_db, the ingestion \
+     builder's with_acl_db, DatasetManager::with_acl). Unset \
+     ENABLE_BACKEND_ACCESS_CONTROL / enable_access_control or set it to false";
+
 /// The registry. Field order follows `Settings`.
 static KEYS: &[KeySpec] = &[
     // -- System paths, users & datasets -------------------------------------
@@ -331,7 +339,34 @@ static KEYS: &[KeySpec] = &[
     // -- Authentication / ACL -----------------------------------------------
     row!(default_user_email: str, env ["DEFAULT_USER_EMAIL"]),
     row!(default_user_password: str secret, env ["DEFAULT_USER_PASSWORD"]),
-    row!(enable_access_control: bool, env ["ENABLE_BACKEND_ACCESS_CONTROL"]),
+    // Reserved, not acted on: kept so the Python SDK's env var stays a known
+    // setting (Python-parity configs carry `ENABLE_BACKEND_ACCESS_CONTROL=false`),
+    // but `true` is rejected. `set` refuses it at once; a `true` from env or a
+    // loaded config is stored so `ConfigManager::check_strict` reports it at
+    // first use.
+    KeySpec {
+        key: "enable_access_control",
+        key_aliases: &[],
+        env: &["ENABLE_BACKEND_ACCESS_CONTROL"],
+        secret: false,
+        persisted: true,
+        overlay: |s, env| {
+            kind::overlay_bool(
+                &mut s.enable_access_control,
+                env,
+                &["ENABLE_BACKEND_ACCESS_CONTROL"],
+            );
+        },
+        set: |s, key, v| {
+            if as_bool(key, &v)? {
+                return Err(mismatch(key, ACCESS_CONTROL_UNSUPPORTED));
+            }
+            s.enable_access_control = false;
+            Ok(())
+        },
+        get: |s| Value::Bool(s.enable_access_control),
+        reset: |s, d| s.enable_access_control = d.enable_access_control,
+    },
     // -- Logging ------------------------------------------------------------
     row!(log_level: str, env ["LOG_LEVEL"]),
     // -- Observability ------------------------------------------------------
@@ -455,6 +490,25 @@ impl Settings {
         cognee_config_core::unknown_key(key, self.strict_config).map_err(ConfigError::from)
     }
 
+    /// Fail if a setting holds a value cognee-rust accepts as a key but does
+    /// not support. Today that is `enable_access_control = true`
+    /// (`ENABLE_BACKEND_ACCESS_CONTROL`): backend access control is wired only
+    /// by an application that attaches its own `AclDb`, so a configuration
+    /// asking for it is an error rather than a silently inert flag. `false`
+    /// (the default) is accepted.
+    ///
+    /// [`ConfigManager::check_strict`](super::ConfigManager::check_strict)
+    /// runs this regardless of `strict_config`.
+    pub fn check_supported(&self) -> Result<(), ConfigError> {
+        if self.enable_access_control {
+            return Err(mismatch(
+                "enable_access_control",
+                ACCESS_CONTROL_UNSUPPORTED,
+            ));
+        }
+        Ok(())
+    }
+
     /// The current value of setting `key` (or an alias) as JSON, unmasked.
     /// `None` for an unknown key.
     pub fn get_key(&self, key: &str) -> Option<Value> {
@@ -571,6 +625,81 @@ mod tests {
             .config_schema()
             .unwrap();
         schema.merge(&builtins).unwrap();
+    }
+
+    fn assert_access_control_rejected(result: Result<(), ConfigError>) {
+        match result {
+            Err(ConfigError::TypeMismatch { key, reason }) => {
+                assert_eq!(key, "enable_access_control");
+                assert!(reason.contains("AclDb"), "{reason}");
+                assert!(reason.contains("ENABLE_BACKEND_ACCESS_CONTROL"), "{reason}");
+            }
+            other => panic!("expected the access-control rejection, got {other:?}"),
+        }
+    }
+
+    /// `ENABLE_BACKEND_ACCESS_CONTROL=true` is an error at first use, without
+    /// `strict_config`; `false` and unset are accepted.
+    #[test]
+    fn access_control_from_env_true_is_rejected() {
+        use crate::config::{ConfigManager, MapEnv};
+        for raw in ["true", "1", "yes", "ON"] {
+            let mut s = Settings::default();
+            s.overlay_from(&MapEnv::new().with("ENABLE_BACKEND_ACCESS_CONTROL", raw));
+            assert!(!s.strict_config);
+            assert_access_control_rejected(s.check_supported());
+            assert_access_control_rejected(ConfigManager::new(s).check_strict());
+        }
+        for raw in ["false", "0", "no", ""] {
+            let mut s = Settings::default();
+            s.overlay_from(&MapEnv::new().with("ENABLE_BACKEND_ACCESS_CONTROL", raw));
+            assert!(!s.enable_access_control, "{raw:?}");
+            ConfigManager::new(s).check_strict().unwrap();
+        }
+    }
+
+    /// `set` / `set_key` refuse `true` at once and accept `false`.
+    #[test]
+    fn access_control_set_true_is_rejected() {
+        use crate::config::ConfigManager;
+        let cm = ConfigManager::new(Settings::default());
+        assert_access_control_rejected(cm.set("enable_access_control", Value::Bool(true)));
+        assert!(!cm.read().enable_access_control);
+        assert_eq!(cm.version(), 0, "a rejected set changes nothing");
+        cm.set("enable_access_control", Value::Bool(false)).unwrap();
+        cm.check_strict().unwrap();
+        // Still a boolean key: a wrong type is the usual type mismatch.
+        assert!(matches!(
+            cm.set("enable_access_control", Value::from("true")),
+            Err(ConfigError::TypeMismatch { reason, .. }) if reason == "expected a boolean"
+        ));
+
+        let mut s = Settings::default();
+        assert_access_control_rejected(s.set_key("enable_access_control", Value::Bool(true)));
+        s.set_key("enable_access_control", Value::Bool(false))
+            .unwrap();
+        assert!(!s.enable_access_control);
+    }
+
+    /// A config file or binding settings object carrying `true` fails at first
+    /// use (or at once through `apply_patch`); `false` loads.
+    #[test]
+    fn access_control_from_json_true_is_rejected() {
+        use crate::config::ConfigManager;
+        let s: Settings =
+            serde_json::from_value(serde_json::json!({ "enable_access_control": true })).unwrap();
+        assert_access_control_rejected(ConfigManager::new(s).check_strict());
+
+        let s: Settings =
+            serde_json::from_value(serde_json::json!({ "enable_access_control": false })).unwrap();
+        ConfigManager::new(s).check_strict().unwrap();
+
+        let cm = ConfigManager::new(Settings::default());
+        let patch = serde_json::json!({ "enable_access_control": true });
+        assert_access_control_rejected(cm.apply_patch(patch.as_object().unwrap()));
+        let patch = serde_json::json!({ "enable_access_control": false });
+        cm.apply_patch(patch.as_object().unwrap()).unwrap();
+        cm.check_strict().unwrap();
     }
 
     /// Every row's get/set round-trips its default value.

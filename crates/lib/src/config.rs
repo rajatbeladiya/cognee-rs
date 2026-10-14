@@ -947,6 +947,9 @@ impl Default for Settings {
 pub enum ConfigError {
     #[error("Unknown config key: {0}")]
     UnknownKey(String),
+    /// The value is not one the key accepts: the wrong JSON type, a value
+    /// that fails the key's validation, or one cognee-rust does not support
+    /// (`enable_access_control = true`). `reason` says which.
     #[error("Type mismatch for key '{key}': {reason}")]
     TypeMismatch { key: String, reason: String },
 }
@@ -1114,8 +1117,11 @@ impl ConfigManager {
 
     /// Fail if the configuration that was loaded in bulk (a config file, a
     /// binding's settings object) held a value of the wrong type for a known
-    /// key, or, with `strict_config` on, a key that no registered setting
-    /// owns. Otherwise `Ok`: unknown keys were already reported as warnings.
+    /// key, if any setting holds an unsupported value
+    /// ([`Settings::check_supported`]: `enable_access_control = true`, from
+    /// env too), or, with `strict_config` on, if a key no registered setting
+    /// owns is present. Otherwise `Ok`: unknown keys were already reported as
+    /// warnings.
     ///
     /// Explicit [`ConfigManager::set`] calls apply the policy themselves; this
     /// covers keys that arrived in bulk, which are checked when the
@@ -1134,6 +1140,10 @@ impl ConfigManager {
                 reason: reason.clone(),
             });
         }
+        // A value the key accepts but cognee-rust does not support (e.g.
+        // `enable_access_control = true` from env or a config file): always an
+        // error, like a wrongly typed one.
+        s.check_supported()?;
         if !s.strict_config {
             return Ok(());
         }
