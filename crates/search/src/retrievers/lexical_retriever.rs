@@ -146,6 +146,10 @@ fn fingerprint(chunks: &[LoadedChunk]) -> u64 {
 /// (`L*`) and numbers (`N*`) — or the underscore. Unlike Rust's
 /// `char::is_alphanumeric`, this excludes combining marks such as Devanagari
 /// vowel signs, which Python's `\w` does not match.
+#[allow(
+    clippy::expect_used,
+    reason = "a constant pattern that compiles; the word-pattern test exercises it"
+)]
 static WORD: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"[\p{L}\p{N}_]+").expect("the word pattern is a valid regex"));
 
@@ -280,6 +284,7 @@ impl LexicalRetriever {
     /// the chunk list's fingerprint is unchanged.
     ///
     /// No usable chunk is Python's `NoDataError` (`lexical_retriever.py:90-92`).
+    #[allow(clippy::unwrap_used, reason = "lock poison is unrecoverable")]
     async fn load_corpus(&self) -> Result<(Vec<LoadedChunk>, Arc<Corpus>), SearchError> {
         let chunks = self.load_document_chunks().await?;
         let key = fingerprint(&chunks);
@@ -287,7 +292,7 @@ impl LexicalRetriever {
         let cached = self
             .corpus_cache
             .lock()
-            .unwrap() // lock poison is unrecoverable
+            .unwrap()
             .as_ref()
             .filter(|(cached_key, _)| *cached_key == key)
             .map(|(_, corpus)| Arc::clone(corpus));
@@ -307,8 +312,7 @@ impl LexicalRetriever {
                     tokens,
                     matches!(self.scorer, LexicalScorer::Bm25 { .. }),
                 ));
-                *self.corpus_cache.lock().unwrap() = // lock poison is unrecoverable
-                    Some((key, Arc::clone(&corpus)));
+                *self.corpus_cache.lock().unwrap() = Some((key, Arc::clone(&corpus)));
                 corpus
             }
         };

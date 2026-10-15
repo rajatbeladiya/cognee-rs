@@ -5,39 +5,19 @@ use cognee_embedding::EmbeddingEngine;
 use cognee_graph::GraphDBTrait;
 use cognee_llm::{GenerationOptions, Llm, Message};
 use cognee_vector::VectorDB;
-use serde_json::json;
 use tracing::debug;
 
 use cognee_session::SessionContext;
 
-use crate::graph_retrieval::{
-    DEFAULT_TRIPLET_DISTANCE_PENALTY, GraphRetrievalConfig, brute_force_triplet_search,
-};
 use crate::retrievers::SearchRetriever;
-use crate::types::{
-    SearchContext, SearchError, SearchItem, SearchOutput, SearchParams, SearchType,
-};
-use crate::utils::{
-    EMPTY_GRAPH_MESSAGE, build_messages_with_history, render_edges_context,
-    render_graph_user_prompt, resolve_system_prompt, skip_completion_on_empty_context,
-};
-
-const DEFAULT_TOP_K: usize = 10;
-const DEFAULT_WIDE_SEARCH_TOP_K: usize = 100;
+use crate::retrievers::graph_core::{GraphPrompts, GraphRetrieverCore, complete};
+use crate::types::{SearchContext, SearchError, SearchOutput, SearchParams, SearchType};
+use crate::utils::{render_edges_context, skip_completion_on_empty_context};
 
 pub struct GraphCompletionRetriever {
-    vector_db: Arc<dyn VectorDB>,
-    embedding_engine: Arc<dyn EmbeddingEngine>,
-    graph_db: Arc<dyn GraphDBTrait>,
+    core: GraphRetrieverCore,
     llm: Arc<dyn Llm>,
-    top_k: usize,
-    wide_search_top_k: usize,
-    triplet_distance_penalty: f32,
-    feedback_influence: f32,
-    neighbor_cap: Option<usize>,
-    system_prompt: Option<String>,
-    system_prompt_path: Option<String>,
-    user_prompt_template: Option<String>,
+    prompts: GraphPrompts,
     generation_options: Option<GenerationOptions>,
 }
 
@@ -56,42 +36,20 @@ impl GraphCompletionRetriever {
         if graph_context_text.is_empty() {
             return Ok(None);
         }
-
-        let system_prompt = resolve_system_prompt(
-            params
-                .system_prompt
-                .as_deref()
-                .or(self.system_prompt.as_deref()),
-            params
-                .system_prompt_path
-                .as_deref()
-                .or(self.system_prompt_path.as_deref()),
-        )?;
-
-        let user_prompt = render_graph_user_prompt(
-            self.user_prompt_template.as_deref(),
-            query,
-            &graph_context_text,
-        );
-
         debug!(
             context_items = context.len(),
             "Graph context assembled:\n{graph_context_text}"
         );
-        debug!("LLM user prompt:\n{user_prompt}");
-
-        Ok(Some(build_messages_with_history(
-            system_prompt,
-            user_prompt,
-            session,
-        )))
+        self.prompts
+            .messages(query, &graph_context_text, session, params)
+            .map(Some)
     }
 
     /// Cap the neighbours expanded per seed node in triplet search
     /// (`search.triplet_neighbor_cap`); `None` is uncapped.
     #[must_use]
     pub fn with_neighbor_cap(mut self, cap: Option<usize>) -> Self {
-        self.neighbor_cap = cap;
+        self.core.neighbor_cap = cap;
         self
     }
 
@@ -110,19 +68,20 @@ impl GraphCompletionRetriever {
         generation_options: Option<GenerationOptions>,
     ) -> Self {
         Self {
-            vector_db,
-            embedding_engine,
-            graph_db,
+            core: GraphRetrieverCore::new(
+                vector_db,
+                embedding_engine,
+                graph_db,
+                top_k,
+                wide_search_top_k,
+                triplet_distance_penalty,
+            ),
             llm,
-            top_k: top_k.unwrap_or(DEFAULT_TOP_K),
-            wide_search_top_k: wide_search_top_k.unwrap_or(DEFAULT_WIDE_SEARCH_TOP_K),
-            triplet_distance_penalty: triplet_distance_penalty
-                .unwrap_or(DEFAULT_TRIPLET_DISTANCE_PENALTY),
-            feedback_influence: 0.0,
-            neighbor_cap: None,
-            system_prompt,
-            system_prompt_path,
-            user_prompt_template,
+            prompts: GraphPrompts {
+                system_prompt,
+                system_prompt_path,
+                user_prompt_template,
+            },
             generation_options,
         }
     }
@@ -137,7 +96,7 @@ impl SearchRetriever for GraphCompletionRetriever {
     #[cfg(test)]
     fn applied_tuning(&self) -> crate::retrievers::AppliedTuning {
         crate::retrievers::AppliedTuning {
-            neighbor_cap: Some(self.neighbor_cap),
+            neighbor_cap: Some(self.core.neighbor_cap),
             ..Default::default()
         }
     }
@@ -152,59 +111,10 @@ impl SearchRetriever for GraphCompletionRetriever {
         query: &str,
         params: &SearchParams,
     ) -> Result<SearchContext, SearchError> {
-        // Python raises `NoDataError` here (`graph_completion_retriever.py:
-        // 139-148`, SDK-270): an empty graph is a state problem, not a query
-        // miss. A populated graph with no matching triplets still returns an
-        // empty context below. Same error and message as the hybrid retriever.
-        if self.graph_db.is_empty().await? {
-            return Err(SearchError::NotFound(EMPTY_GRAPH_MESSAGE.to_string()));
-        }
-
-        let config = GraphRetrievalConfig {
-            top_k: params.top_k_or(self.top_k),
-            wide_search_top_k: params.wide_search_top_k_or(self.wide_search_top_k),
-            triplet_distance_penalty: params
-                .triplet_distance_penalty_or(self.triplet_distance_penalty),
-            feedback_influence: params.feedback_influence_or(self.feedback_influence),
-            neighbor_cap: self.neighbor_cap,
-            node_type: params.node_type.clone(),
-            node_name: params.node_name.clone(),
-            node_name_filter_operator: params
-                .node_name_filter_operator
-                .as_deref()
-                .unwrap_or("OR")
-                .to_string(),
-        };
-
-        let ranked_edges = brute_force_triplet_search(
-            query,
-            self.vector_db.as_ref(),
-            self.embedding_engine.as_ref(),
-            self.graph_db.as_ref(),
-            &config,
-        )
-        .await?;
-
-        Ok(ranked_edges
-            .into_iter()
-            .map(|edge| SearchItem {
-                id: None,
-                score: Some(edge.score),
-                payload: json!({
-                    "source_id": edge.source_id,
-                    "target_id": edge.target_id,
-                    "relationship": edge.relationship_name,
-                    "source_name": edge.source_name,
-                    "target_name": edge.target_name,
-                    "source_text": edge.source_text,
-                    "target_text": edge.target_text,
-                    "source_description": edge.source_description,
-                    "target_description": edge.target_description,
-                    "edge_text": edge.edge_text,
-                    "dataset_id": edge.dataset_id,
-                }),
-            })
-            .collect())
+        // A populated graph with no matching triplets is a normal miss and
+        // returns an empty context; an empty graph is `NotFound`.
+        self.core.ensure_graph_not_empty().await?;
+        self.core.search(query, params).await
     }
 
     async fn completion_messages(
@@ -235,24 +145,13 @@ impl SearchRetriever for GraphCompletionRetriever {
             return Ok(skip_completion_on_empty_context());
         };
 
-        if let Some(schema) = &params.response_schema {
-            let structured_value = self
-                .llm
-                .create_structured_output_with_messages_raw(
-                    messages,
-                    schema,
-                    self.generation_options.clone(),
-                )
-                .await
-                .map_err(|e| SearchError::LlmError(e.to_string()))?;
-            Ok(SearchOutput::Structured(structured_value))
-        } else {
-            let completion = self
-                .llm
-                .generate(messages, self.generation_options.clone())
-                .await?;
-            Ok(SearchOutput::Text(completion.content))
-        }
+        complete(
+            self.llm.as_ref(),
+            messages,
+            params,
+            self.generation_options.clone(),
+        )
+        .await
     }
 }
 

@@ -219,11 +219,12 @@ impl FeelingLuckyRetriever {
         serde_json::from_value::<SearchType>(Value::String(mapped)).ok()
     }
 
+    #[allow(clippy::unwrap_used, reason = "lock poison is unrecoverable")]
     async fn select_retriever(&self, query: &str) -> Result<SearchRetrieverRef, SearchError> {
         let remembered = self
             .last_selection
             .lock()
-            .unwrap() // lock poison is unrecoverable
+            .unwrap()
             .as_ref()
             .filter(|(last_query, _)| last_query == query)
             .map(|(_, search_type)| *search_type);
@@ -231,8 +232,7 @@ impl FeelingLuckyRetriever {
             Some(search_type) => search_type,
             None => {
                 let search_type = self.choose_search_type(query).await;
-                *self.last_selection.lock().unwrap() = // lock poison is unrecoverable
-                    Some((query.to_string(), search_type));
+                *self.last_selection.lock().unwrap() = Some((query.to_string(), search_type));
                 search_type
             }
         };
