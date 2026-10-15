@@ -1506,6 +1506,14 @@ carrying `ENABLE_BACKEND_ACCESS_CONTROL=false` loads without a warning. Python
 defaults the flag to `true`; this is a deliberate divergence. Every truthy
 spelling (`true`, `1`, `yes`, `on`, any case) counts as `true`.
 
+What an attached `AclDb` changes for search and recall: explicit `dataset_ids`
+and dataset names are authorized against the caller's `read` grants, and a
+request that names no dataset is scoped to every dataset the caller may read,
+returning an empty result when there is none (Python's ACL mode, where
+`dataset_ids=None` means "all readable datasets"). Every search then needs the
+caller's user id. Without an `AclDb`, an unfiltered search stays unscoped, as
+in Python's non-ACL mode.
+
 > **Migrating from Python:** Python's `.env.template` ships an uncommented
 > `ENABLE_BACKEND_ACCESS_CONTROL=True`. A `.env` copied from it (cognee-rust loads
 > `.env` automatically) makes every CLI command, every binding operation and

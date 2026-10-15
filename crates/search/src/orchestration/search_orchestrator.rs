@@ -1,5 +1,6 @@
 use crate::orchestration::{
-    SearchTypeRegistry, merge_scoped_contexts, prepare_search_result, scope_context_by_datasets,
+    SearchTypeRegistry, filter_context_to_datasets, merge_scoped_contexts, prepare_search_result,
+    scope_context_by_datasets,
 };
 use crate::types::{
     SearchContext, SearchError, SearchOutput, SearchParams, SearchRequest, SearchResponse,
@@ -139,9 +140,12 @@ pub struct SearchOrchestrator {
     registry: SearchTypeRegistry,
     database: Option<Arc<dyn SearchHistoryDb>>,
     dataset_resolver: Option<Arc<dyn IngestDb>>,
-    /// ACL backend used to authorize caller-supplied `dataset_ids`. `None` in
-    /// OSS builds (this workspace ships no production `AclDb` impl), in which case authorization degrades
-    /// to the ownership check — see the `dataset_ids` block in [`Self::search`].
+    /// ACL backend. When set it authorizes caller-supplied `dataset_ids` and
+    /// dataset names, and scopes a search that names no dataset to every
+    /// dataset the caller may read (see [`Self::search`]). `None` in OSS
+    /// builds (this workspace ships no production `AclDb` impl): explicit
+    /// filters then degrade to the ownership check and an unfiltered search
+    /// stays unscoped, as Python's non-ACL mode is.
     acl_db: Option<Arc<dyn AclDb>>,
     session_manager: Option<Arc<SessionManager>>,
     llm: Option<Arc<dyn Llm>>,
@@ -192,9 +196,23 @@ impl SearchOrchestrator {
     /// "read", dataset_ids)`. Without one the orchestrator falls back to an
     /// ownership check when a `dataset_resolver` is wired, and passes the ids
     /// through unchecked when neither is.
+    ///
+    /// With one wired, a search that names no dataset is no longer unscoped:
+    /// it is scoped to every dataset the caller may read, and returns an empty
+    /// result when that set is empty. That is Python's ACL mode, where
+    /// `authorized_search(dataset_ids=None)` fans out over
+    /// `get_all_user_permission_datasets(user, "read")`. Every search then
+    /// needs `SearchRequest.user_id`.
     pub fn with_acl_db(mut self, acl_db: Arc<dyn AclDb>) -> Self {
         self.acl_db = Some(acl_db);
         self
+    }
+
+    /// Whether an ACL backend is wired ([`Self::with_acl_db`]), i.e. whether
+    /// every search is authorized and scoped to the caller's readable
+    /// datasets and so needs `SearchRequest.user_id`.
+    pub fn has_acl_db(&self) -> bool {
+        self.acl_db.is_some()
     }
 
     pub fn with_session_manager(mut self, session_manager: Arc<SessionManager>) -> Self {
@@ -277,8 +295,9 @@ impl SearchOrchestrator {
         Ok(responses)
     }
 
-    /// The set of dataset ids `requester` may read, for authorizing explicit
-    /// `SearchRequest.dataset_ids`.
+    /// The set of dataset ids `requester` may read: for authorizing explicit
+    /// `SearchRequest.dataset_ids` and, with an ACL wired, as the scope of a
+    /// search that names no dataset.
     ///
     /// One listing query, then membership-checked locally by the caller —
     /// deliberately not a per-id lookup. `dataset_ids` is client-supplied and
@@ -312,7 +331,8 @@ impl SearchOrchestrator {
     /// `tenant: None` means the caller named no tenant and no filter applies,
     /// which is the single-tenant default every OSS row is written under.
     ///
-    /// Callers gate on `acl_db.is_some() || dataset_resolver.is_some()`; if
+    /// Callers gate on `acl_db.is_some() || dataset_resolver.is_some()` (the
+    /// unfiltered-search scope on `acl_db.is_some()` alone); if
     /// neither is wired this returns an empty set, i.e. fails closed rather
     /// than open should that gate ever be removed.
     async fn readable_dataset_ids(
@@ -469,7 +489,10 @@ impl SearchOrchestrator {
         // else the ownership fallback. Without either there is nothing to
         // check against and the ids pass through, which keeps in-process
         // embedders that never wired one working as before.
-        // `Some(vec![])` is "no filter" (Python: `dataset_ids or None`).
+        // `Some(vec![])` names no dataset, like `None` (Python passes
+        // `dataset_ids or None` down). What "no dataset named" means depends on
+        // the mode — every dataset the caller may read with an ACL wired,
+        // unscoped without one — and is settled after name resolution below.
         if let Some(ids) = request.dataset_ids.as_ref().filter(|ids| !ids.is_empty())
             && (self.acl_db.is_some() || self.dataset_resolver.is_some())
         {
@@ -493,13 +516,14 @@ impl SearchOrchestrator {
         //     "If a user wants to write to a dataset he is not the owner of it
         //     must be provided through UUID" — do not widen it to shared
         //     datasets.
-        //   - per-batch error: if ZERO names resolve → `DatasetNotFound`;
-        //     partial misses are logged and the search proceeds with the
-        //     resolved subset (matches `get_authorized_existing_datasets`
-        //     and `cognee/api/v1/search/search.py:242-243`)
-        //   - `datasets=Some(empty_vec)` is treated like `None`: no
-        //     resolution and no scope filter (Python's `if datasets:`
-        //     short-circuits empty lists too)
+        //   - per-batch error: if ZERO names resolve → `DatasetNotFound`
+        //     (Python `cognee/api/v1/search/search.py:331-337` at c0d18c8);
+        //     partial misses are dropped and the search proceeds with the
+        //     resolved subset, as `get_dataset_ids` drops them. Python drops
+        //     them silently; Rust additionally logs a warning.
+        //   - `datasets=Some(empty_vec)` is treated like `None`: no name
+        //     resolution (Python's `if datasets:` short-circuits empty lists
+        //     too); the request then counts as naming no dataset at all.
         //   - explicit `dataset_ids` always wins over `datasets`
         let resolved_request_owned;
         let request: &SearchRequest = match (&request.datasets, &request.dataset_ids) {
@@ -573,6 +597,55 @@ impl SearchOrchestrator {
             _ => request,
         };
 
+        // A request that names no dataset (no ids and no names, empty lists
+        // included). With an ACL wired that means "every dataset the caller may
+        // read", not "unscoped". Python (c0d18c8) runs every search through
+        // `authorized_search` (`cognee/modules/search/methods/search.py:114`),
+        // whose `get_authorized_existing_datasets(None, "read", user)` returns
+        // `get_all_user_permission_datasets(user, "read")`
+        // (`get_authorized_existing_datasets.py:35-37`); in ACL mode it then
+        // searches only those datasets, one task per dataset
+        // (`search.py:359-385`). So the readable set becomes the dataset scope
+        // here and the existing per-dataset scoping below applies, keeping
+        // every other dataset out of the result.
+        //
+        // An empty readable set returns an empty result without running the
+        // retriever. Python gathers zero per-dataset tasks and returns `[]`
+        // (`search.py:429`), with no error.
+        //
+        // Without an ACL this block is skipped and the search stays unscoped:
+        // Python's non-ACL branch ignores the dataset list and runs the
+        // retriever once over the shared store (`search.py:386-427`). Scoping
+        // that path would diverge from Python in the other direction. The
+        // ownership fallback is deliberately not used here for the same
+        // reason.
+        let names_no_dataset = request.dataset_ids.as_ref().is_none_or(Vec::is_empty)
+            && request.datasets.as_ref().is_none_or(Vec::is_empty);
+        let acl_scoped_request_owned;
+        let acl_scoped = self.acl_db.is_some() && names_no_dataset;
+        let request: &SearchRequest = if acl_scoped {
+            let requester = request.user_id.ok_or_else(|| {
+                SearchError::InvalidInput(
+                    "an access-controlled search requires SearchRequest.user_id to find the \
+                     datasets the caller may read"
+                        .to_string(),
+                )
+            })?;
+            let mut readable: Vec<uuid::Uuid> = self
+                .readable_dataset_ids(requester, request.tenant_id)
+                .await?
+                .into_iter()
+                .collect();
+            // Deterministic scope order: the set comes from a HashSet.
+            readable.sort_unstable();
+            let mut clone = request.clone();
+            clone.dataset_ids = Some(readable);
+            acl_scoped_request_owned = clone;
+            &acl_scoped_request_owned
+        } else {
+            request
+        };
+
         let params = SearchParams::from(request);
         let use_dataset_scope = request
             .dataset_ids
@@ -590,6 +663,23 @@ impl SearchOrchestrator {
                 .await
         {
             logged_query_id = Some(query_id);
+        }
+
+        if acl_scoped && !use_dataset_scope {
+            // The caller may read no dataset at all: nothing to search.
+            let response = prepare_search_result(
+                request.search_type,
+                SearchOutput::Items(Vec::new()),
+                None,
+                request.dataset_ids.clone(),
+                request.only_context(),
+                request.use_combined_context(),
+                request.verbose(),
+            );
+            self.log_result_if_enabled(logged_query_id, &response, request.user_id)
+                .await;
+            emit_search_completed(request);
+            return Ok(response);
         }
 
         let include_context =
@@ -616,6 +706,15 @@ impl SearchOrchestrator {
         let context = if let Some(scoped_context_map) = &scoped_contexts {
             if request.use_combined_context() {
                 Some(merge_scoped_contexts(scoped_context_map))
+            } else if acl_scoped
+                && let (Some(dataset_ids), Some(base)) =
+                    (request.dataset_ids.as_ref(), &base_context)
+            {
+                // A scope derived from the caller's readable set has no
+                // "first requested dataset" to answer from: the answer draws on
+                // every readable dataset (Python fans out over each), keeping
+                // the retriever's ranking.
+                Some(filter_context_to_datasets(base, dataset_ids))
             } else if let Some(dataset_ids) = request.dataset_ids.as_ref() {
                 let first_key = dataset_ids.first().map(|id| id.to_string());
                 first_key
@@ -2448,6 +2547,290 @@ mod tests {
             })
             .await
             .expect("granted id must pass without a resolver");
+    }
+
+    /// Counts `get_context` / `get_completion` calls and serves one item per
+    /// fixture dataset, so a test can tell whether retrieval ran at all and
+    /// which datasets survived the scope filter.
+    struct CountingFixtureRetriever {
+        dataset_a: uuid::Uuid,
+        dataset_b: uuid::Uuid,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl SearchRetriever for CountingFixtureRetriever {
+        fn search_type(&self) -> SearchType {
+            SearchType::Chunks
+        }
+
+        async fn get_context(
+            &self,
+            query: &str,
+            params: &SearchParams,
+        ) -> Result<SearchContext, SearchError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            ResolutionFixtureRetriever {
+                dataset_a: self.dataset_a,
+                dataset_b: self.dataset_b,
+            }
+            .get_context(query, params)
+            .await
+        }
+
+        async fn get_completion(
+            &self,
+            _query: &str,
+            context: Option<SearchContext>,
+            _session: &SessionContext,
+            _params: &SearchParams,
+        ) -> Result<SearchOutput, SearchError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(SearchOutput::Items(context.unwrap_or_default()))
+        }
+    }
+
+    fn item_texts(output: &SearchOutput) -> Vec<String> {
+        match output {
+            SearchOutput::Items(items) => items
+                .iter()
+                .filter_map(|item| item.payload["text"].as_str().map(str::to_string))
+                .collect(),
+            other => panic!("expected Items, got {other:?}"),
+        }
+    }
+
+    /// SDK-687. Scenario: an ACL is wired; the caller may read dataset A
+    /// (shared with it, not owned) but not dataset B; the request names no
+    /// dataset — `None`, or empty lists, in every combination.
+    /// Expected: the search is scoped to the readable set, exactly as Python's
+    /// ACL mode `authorized_search(dataset_ids=None)` fans out over
+    /// `get_all_user_permission_datasets(user, "read")`. B's item never
+    /// reaches the result, the context map, or the completion's context.
+    /// Before the fix this request skipped authorization entirely and
+    /// returned B's item too.
+    #[tokio::test]
+    async fn acl_wired_unfiltered_search_is_scoped_to_readable_datasets() {
+        let caller = Uuid::new_v4();
+        let dataset_a = Uuid::new_v4();
+        let dataset_b = Uuid::new_v4();
+        let acl = Arc::new(cognee_test_utils::MockAclDb::new());
+        acl.grant_permission(caller, dataset_a, "read")
+            .await
+            .expect("grant");
+        // B is readable by someone else, so it exists in the ACL.
+        acl.grant_permission(Uuid::new_v4(), dataset_b, "read")
+            .await
+            .expect("grant");
+
+        let mut registry = SearchTypeRegistry::new();
+        registry.register(Arc::new(ResolutionFixtureRetriever {
+            dataset_a,
+            dataset_b,
+        }));
+        let orchestrator =
+            super::SearchOrchestrator::new(registry).with_acl_db(acl as Arc<dyn AclDb>);
+
+        let no_filter = [
+            (None, None),
+            (Some(vec![]), None),
+            (None, Some(vec![])),
+            (Some(vec![]), Some(vec![])),
+        ];
+        for (dataset_ids, datasets) in no_filter {
+            for only_context in [true, false] {
+                let label = format!(
+                    "dataset_ids={dataset_ids:?} datasets={datasets:?} only_context={only_context}"
+                );
+                let response = orchestrator
+                    .search(&SearchRequest {
+                        dataset_ids: dataset_ids.clone(),
+                        datasets: datasets.clone(),
+                        user_id: Some(caller),
+                        only_context: Some(only_context),
+                        verbose: Some(true),
+                        ..dataset_request_template()
+                    })
+                    .await
+                    .unwrap_or_else(|e| panic!("{label}: {e:?}"));
+
+                assert_eq!(
+                    item_texts(&response.result),
+                    vec!["A context".to_string()],
+                    "{label}: only the readable dataset's item may be returned"
+                );
+                assert_eq!(
+                    response.datasets,
+                    Some(vec![dataset_a]),
+                    "{label}: the scope is the readable set"
+                );
+                let context_map = response.context.expect("scoped context map");
+                assert!(context_map.contains_key(&dataset_a.to_string()), "{label}");
+                assert!(
+                    !context_map.contains_key(&dataset_b.to_string()),
+                    "{label}: an unreadable dataset must not appear"
+                );
+                assert!(
+                    context_map
+                        .values()
+                        .flatten()
+                        .all(|item| item.payload["text"] != "B context"),
+                    "{label}: B's item must not leak into any bucket"
+                );
+            }
+        }
+    }
+
+    /// SDK-687. Scenario: an ACL is wired; the caller may read datasets A and
+    /// B, the request names no dataset, and the completion path runs.
+    /// Expected: the completion sees both readable datasets' items in the
+    /// retriever's order — a derived scope has no "first requested dataset"
+    /// to narrow to.
+    #[tokio::test]
+    async fn acl_wired_unfiltered_completion_draws_on_every_readable_dataset() {
+        let caller = Uuid::new_v4();
+        let dataset_a = Uuid::new_v4();
+        let dataset_b = Uuid::new_v4();
+        let acl = Arc::new(cognee_test_utils::MockAclDb::new());
+        for dataset in [dataset_a, dataset_b] {
+            acl.grant_permission(caller, dataset, "read")
+                .await
+                .expect("grant");
+        }
+
+        let mut registry = SearchTypeRegistry::new();
+        registry.register(Arc::new(ResolutionFixtureRetriever {
+            dataset_a,
+            dataset_b,
+        }));
+        let orchestrator =
+            super::SearchOrchestrator::new(registry).with_acl_db(acl as Arc<dyn AclDb>);
+
+        let response = orchestrator
+            .search(&SearchRequest {
+                user_id: Some(caller),
+                only_context: Some(false),
+                ..dataset_request_template()
+            })
+            .await
+            .expect("search");
+        assert_eq!(
+            item_texts(&response.result),
+            vec!["A context".to_string(), "B context".to_string()]
+        );
+    }
+
+    /// SDK-687. Scenario: an ACL is wired and the caller may read no dataset;
+    /// the request names none.
+    /// Expected: an empty result and no error, without running the retriever
+    /// at all — Python's `search_in_datasets_context` gathers zero
+    /// per-dataset tasks and returns `[]`.
+    #[tokio::test]
+    async fn acl_wired_unfiltered_search_with_nothing_readable_is_empty() {
+        let caller = Uuid::new_v4();
+        let acl = Arc::new(cognee_test_utils::MockAclDb::new());
+        // Someone else's grant: the ACL is not empty, the caller's set is.
+        acl.grant_permission(Uuid::new_v4(), Uuid::new_v4(), "read")
+            .await
+            .expect("grant");
+
+        let retriever = Arc::new(CountingFixtureRetriever {
+            dataset_a: Uuid::new_v4(),
+            dataset_b: Uuid::new_v4(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mut registry = SearchTypeRegistry::new();
+        registry.register(Arc::clone(&retriever) as Arc<dyn SearchRetriever>);
+        let orchestrator =
+            super::SearchOrchestrator::new(registry).with_acl_db(acl as Arc<dyn AclDb>);
+
+        for only_context in [true, false] {
+            let response = orchestrator
+                .search(&SearchRequest {
+                    user_id: Some(caller),
+                    only_context: Some(only_context),
+                    ..dataset_request_template()
+                })
+                .await
+                .expect("nothing readable is an empty result, not an error");
+            assert!(item_texts(&response.result).is_empty());
+            assert!(response.context.is_none());
+            assert_eq!(response.datasets, Some(vec![]));
+        }
+        assert_eq!(
+            retriever.calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the retriever must not run when the caller may read nothing"
+        );
+    }
+
+    /// SDK-687. Scenario: an ACL is wired and the request names no dataset
+    /// and no caller.
+    /// Expected: `InvalidInput` — with an ACL the readable set depends on the
+    /// caller, and an unknown caller must not fall back to an unscoped search.
+    #[tokio::test]
+    async fn acl_wired_unfiltered_search_without_user_id_is_invalid_input() {
+        let mut registry = SearchTypeRegistry::new();
+        registry.register(Arc::new(FakeChunksRetriever));
+        let orchestrator = super::SearchOrchestrator::new(registry)
+            .with_acl_db(Arc::new(cognee_test_utils::MockAclDb::new()) as Arc<dyn AclDb>);
+
+        let err = orchestrator
+            .search(&dataset_request_template())
+            .await
+            .expect_err("must error");
+        assert!(matches!(err, SearchError::InvalidInput(_)), "got {err:?}");
+    }
+
+    /// SDK-687 guard. Scenario: no ACL is wired — with and without the
+    /// ownership resolver — and the request names no dataset; the caller owns
+    /// neither fixture dataset.
+    /// Expected: unchanged, unscoped behaviour: every item the retriever
+    /// returns, no per-dataset map. Python's non-ACL mode runs the retriever
+    /// once over the shared store; scoping here would diverge from it.
+    #[tokio::test]
+    async fn no_acl_unfiltered_search_stays_unscoped() {
+        let caller = Uuid::new_v4();
+        let dataset_a = Uuid::new_v4();
+        let dataset_b = Uuid::new_v4();
+        let db = fresh_db().await;
+
+        let registry = || {
+            let mut registry = SearchTypeRegistry::new();
+            registry.register(Arc::new(ResolutionFixtureRetriever {
+                dataset_a,
+                dataset_b,
+            }));
+            registry
+        };
+        let orchestrators = [
+            super::SearchOrchestrator::new(registry()),
+            super::SearchOrchestrator::new(registry())
+                .with_dataset_resolver(db as Arc<dyn IngestDb>),
+        ];
+        for orchestrator in orchestrators {
+            assert!(!orchestrator.has_acl_db());
+            for user_id in [None, Some(caller)] {
+                let response = orchestrator
+                    .search(&SearchRequest {
+                        user_id,
+                        verbose: Some(true),
+                        ..dataset_request_template()
+                    })
+                    .await
+                    .expect("an unfiltered search without an ACL must not error");
+                assert_eq!(
+                    item_texts(&response.result),
+                    vec!["A context".to_string(), "B context".to_string()]
+                );
+                assert_eq!(response.datasets, None);
+                let context_map = response.context.expect("default context");
+                assert_eq!(
+                    context_map.keys().collect::<Vec<_>>(),
+                    vec![CONTEXT_LABEL_DEFAULT]
+                );
+            }
+        }
     }
 
     /// Scenario: `dataset_ids: Some(vec![])` alongside a real name.

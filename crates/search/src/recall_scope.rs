@@ -454,18 +454,22 @@ pub async fn run_graph(
     // `authorized_search(dataset_ids=...)`), so it needs the caller's identity
     // on the request. Recall's `user_id` is a string because the session
     // helpers key on strings; the graph side needs the UUID form. A non-UUID
-    // caller id only matters when a dataset filter is in play -- without one
-    // the graph search has no owner scope to apply and the value is simply not
+    // caller id matters when a dataset filter is in play, or when the
+    // orchestrator has an ACL wired: then even an unfiltered search is scoped
+    // to the datasets the caller may read (Python's `authorized_search` with
+    // `dataset_ids=None`), which needs the caller's identity. Otherwise the
+    // graph search has no owner scope to apply and the value is simply not
     // forwarded, as before.
-    let has_dataset_filter = datasets.as_ref().is_some_and(|d| !d.is_empty())
-        || dataset_ids.as_ref().is_some_and(|d| !d.is_empty());
+    let needs_caller = datasets.as_ref().is_some_and(|d| !d.is_empty())
+        || dataset_ids.as_ref().is_some_and(|d| !d.is_empty())
+        || search_orchestrator.has_acl_db();
     let owner_id: Option<Uuid> = match user_id {
         None => None,
         Some(raw) => match Uuid::parse_str(raw) {
             Ok(id) => Some(id),
-            Err(error) if has_dataset_filter => {
+            Err(error) if needs_caller => {
                 return Err(SearchError::InvalidInput(format!(
-                    "dataset filter requires a UUID user_id to identify the owner, \
+                    "a dataset filter or access control requires a UUID user_id to identify the caller, \
                      got '{raw}': {error}"
                 )));
             }
@@ -754,7 +758,7 @@ mod tests {
     use crate::types::{SearchContext, SearchOutput, SearchParams};
     use async_trait::async_trait;
     use cognee_database::ops as db_ops;
-    use cognee_database::{IngestDb, connect, initialize};
+    use cognee_database::{AclDb, IngestDb, connect, initialize};
     use cognee_models::Dataset;
     use cognee_session::SessionContext;
     use std::sync::Arc;
@@ -1016,5 +1020,108 @@ mod tests {
             retriever.seen.lock().expect("test mutex").is_none(),
             "retriever must not run for a denied id"
         );
+    }
+
+    /// SDK-687, recall side: `/v1/recall` reaches the orchestrator through
+    /// `run_graph`, so with an ACL wired an unfiltered recall must be scoped
+    /// to the caller's readable datasets like an unfiltered search, and an
+    /// unreadable dataset must never reach the retriever's scope.
+    #[tokio::test]
+    async fn run_graph_unfiltered_with_acl_is_scoped_to_readable_datasets() {
+        let owner = Uuid::new_v4();
+        let (orchestrator, retriever, dataset_id) =
+            orchestrator_with_seeded_dataset("notes", owner).await;
+        let acl = Arc::new(cognee_test_utils::MockAclDb::new());
+        acl.grant_permission(owner, dataset_id, "read")
+            .await
+            .expect("grant");
+        // A dataset someone else may read, which the caller may not.
+        acl.grant_permission(Uuid::new_v4(), Uuid::new_v4(), "read")
+            .await
+            .expect("grant");
+        let orchestrator = orchestrator.with_acl_db(acl as Arc<dyn AclDb>);
+        let owner_str = owner.to_string();
+        let span = tracing::Span::none();
+
+        run_graph(
+            "anything",
+            Some(SearchType::Chunks),
+            None,
+            None,
+            5,
+            false,
+            None,
+            Some(owner_str.as_str()),
+            &orchestrator,
+            &span,
+            None,
+        )
+        .await
+        .expect("an unfiltered recall with a readable dataset must succeed");
+
+        let seen = retriever
+            .seen
+            .lock()
+            .expect("test mutex")
+            .clone()
+            .expect("retriever must have been invoked");
+        assert_eq!(
+            seen.dataset_ids.as_deref(),
+            Some([dataset_id].as_slice()),
+            "the scope must be exactly the caller's readable set"
+        );
+    }
+
+    /// With an ACL wired, an unfiltered recall by a caller who may read
+    /// nothing returns no graph items and never runs the retriever; a caller
+    /// id that is not a UUID cannot be authorized and is rejected even
+    /// without a filter.
+    #[tokio::test]
+    async fn run_graph_unfiltered_with_acl_and_nothing_readable_is_empty() {
+        let owner = Uuid::new_v4();
+        let (orchestrator, retriever, _dataset_id) =
+            orchestrator_with_seeded_dataset("notes", owner).await;
+        let orchestrator = orchestrator
+            .with_acl_db(Arc::new(cognee_test_utils::MockAclDb::new()) as Arc<dyn AclDb>);
+        let owner_str = owner.to_string();
+        let span = tracing::Span::none();
+
+        let (items, _used, _auto, _response) = run_graph(
+            "anything",
+            Some(SearchType::Chunks),
+            None,
+            None,
+            5,
+            false,
+            None,
+            Some(owner_str.as_str()),
+            &orchestrator,
+            &span,
+            None,
+        )
+        .await
+        .expect("nothing readable is an empty result, not an error");
+        assert!(items.is_empty(), "got {items:?}");
+        assert!(
+            retriever.seen.lock().expect("test mutex").is_none(),
+            "retriever must not run when the caller may read no dataset"
+        );
+
+        let err = run_graph(
+            "anything",
+            Some(SearchType::Chunks),
+            None,
+            None,
+            5,
+            false,
+            None,
+            Some("user-1"),
+            &orchestrator,
+            &span,
+            None,
+        )
+        .await
+        .expect_err("a non-UUID caller cannot be authorized under ACL");
+        assert!(matches!(err, SearchError::InvalidInput(_)), "got {err:?}");
     }
 }
