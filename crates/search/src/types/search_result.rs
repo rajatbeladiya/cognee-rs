@@ -80,6 +80,23 @@ pub struct SearchResponse {
     /// active, since that is where the Rust completion sends it.
     #[serde(default)]
     pub system_prompt: Option<String>,
+    /// For an `only_context` search over several datasets without
+    /// `use_combined_context`: the prompt built from each dataset's own
+    /// context, keyed by dataset id like [`context`](Self::context). Python
+    /// builds one prompt per dataset in its fan-out. A dataset whose context
+    /// is empty, or whose retriever sends no single prompt, has no entry.
+    /// [`user_prompt`](Self::user_prompt) stays the first dataset's — the one
+    /// the completion answers from.
+    #[serde(default)]
+    pub prompts: Option<HashMap<String, SearchPrompt>>,
+}
+
+/// The two messages a completion sends, as an `only_context` search returns
+/// them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SearchPrompt {
+    pub user_prompt: String,
+    pub system_prompt: String,
 }
 
 impl SearchResponse {
@@ -96,6 +113,7 @@ impl SearchResponse {
             verbose: false,
             user_prompt: None,
             system_prompt: None,
+            prompts: None,
         }
     }
 }

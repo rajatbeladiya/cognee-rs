@@ -79,6 +79,7 @@ pub fn prepare_search_result(
         verbose,
         user_prompt: None,
         system_prompt: None,
+        prompts: None,
     }
 }
 

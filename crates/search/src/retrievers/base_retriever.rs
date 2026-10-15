@@ -53,10 +53,16 @@ pub trait SearchRetriever: Send + Sync {
     /// search returns in place of the bare context.
     ///
     /// `None` when this retriever sends no single templated prompt (the
-    /// non-generative types, and the multi-step ones not yet wired here) or
-    /// when the rendered context is empty, which is also when
-    /// `get_completion` skips the LLM. Python's `build_only_context_prompt`
-    /// (`only_context_prompt.py`) returns `None` in the same two cases.
+    /// non-generative types: chunks, summaries, lexical, Cypher, natural
+    /// language, coding rules, feedback) or when the rendered context is
+    /// empty, which is also when `get_completion` skips the LLM. Python's
+    /// `build_only_context_prompt` (`only_context_prompt.py`) returns `None`
+    /// in the same two cases.
+    ///
+    /// Retrievers whose context stage calls the LLM — graph summary's
+    /// summarization, chain-of-thought and context-extension rounds, hybrid's
+    /// overflow summaries — make those calls here too, as Python's preview
+    /// does; only the answer itself is never generated.
     ///
     /// Implementations must build the messages with the same code their
     /// `get_completion` uses, so the preview cannot drift from the real call.

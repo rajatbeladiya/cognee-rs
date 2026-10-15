@@ -2,12 +2,14 @@ use crate::orchestration::{
     SearchTypeRegistry, merge_scoped_contexts, prepare_search_result, scope_context_by_datasets,
 };
 use crate::types::{
-    SearchContext, SearchError, SearchOutput, SearchParams, SearchRequest, SearchResponse,
+    SearchContext, SearchError, SearchOutput, SearchParams, SearchPrompt, SearchRequest,
+    SearchResponse,
 };
 use crate::utils::detect_feedback;
 use cognee_database::{AclDb, IngestDb, SearchHistoryDb, SearchHistoryEntry};
 use cognee_llm::{Llm, Message, MessageRole};
 use cognee_session::{SessionContext, SessionManager, UsedGraphElementIds};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Fire-and-forget product analytics event for the start of a search.
@@ -650,22 +652,61 @@ impl SearchOrchestrator {
             // What the completion would have sent instead of the bare context
             // (Python's `build_only_context_prompt`, `only_context_prompt.py`):
             // the same messages, built by the same code, with the session read
-            // as it stands — no LLM call and no session write. Only built when
-            // retrieval found something, so a miss stays detectable and pays
-            // no session read.
-            let messages = if output_context.is_empty() {
-                None
-            } else {
-                let session_context = self.load_session_context(request).await;
+            // as it stands — no answer generated and no session write. Only
+            // built when retrieval found something, so a miss stays detectable
+            // and pays no session read; the session is read once and shared by
+            // every dataset's prompt (Python's `SharedSessionHistory`).
+            let mut session_context: Option<SessionContext> = None;
+            let mut prompt_for = async |context: &SearchContext| {
+                if context.is_empty() {
+                    return Ok::<_, SearchError>(None);
+                }
+                if session_context.is_none() {
+                    session_context = Some(self.load_session_context(request).await);
+                }
+                // Always `Some` here: the default is never built.
+                let session = session_context.get_or_insert_with(SessionContext::default);
                 retriever
-                    .completion_messages(
-                        &request.query_text,
-                        &output_context,
-                        &session_context,
-                        &params,
-                    )
-                    .await?
+                    .completion_messages(&request.query_text, context, session, &params)
+                    .await
             };
+
+            let messages = prompt_for(&output_context).await?;
+
+            // Several datasets without combining: one prompt per dataset, from
+            // that dataset's own context, as Python's per-dataset fan-out
+            // builds them. The first dataset's is the one already built.
+            let first_dataset_key = request
+                .dataset_ids
+                .as_ref()
+                .and_then(|ids| ids.first())
+                .map(uuid::Uuid::to_string);
+            let mut prompts_by_dataset = None;
+            if let Some(scoped_context_map) = &scoped_contexts
+                && !request.use_combined_context()
+                && scoped_context_map.len() > 1
+            {
+                let mut prompts = HashMap::new();
+                for (dataset_key, dataset_context) in scoped_context_map {
+                    let dataset_messages = if Some(dataset_key) == first_dataset_key.as_ref() {
+                        messages.clone()
+                    } else {
+                        prompt_for(dataset_context).await?
+                    };
+                    if let (Some(user_prompt), Some(system_prompt)) =
+                        split_prompt_messages(dataset_messages)
+                    {
+                        prompts.insert(
+                            dataset_key.clone(),
+                            SearchPrompt {
+                                user_prompt,
+                                system_prompt,
+                            },
+                        );
+                    }
+                }
+                prompts_by_dataset = Some(prompts);
+            }
             let (user_prompt, system_prompt) = split_prompt_messages(messages);
 
             // Python's `SearchResultPayload.result`: the user prompt when one
@@ -686,6 +727,7 @@ impl SearchOrchestrator {
             );
             response.user_prompt = user_prompt;
             response.system_prompt = system_prompt;
+            response.prompts = prompts_by_dataset;
 
             if let Some(scoped_context_map) = scoped_contexts
                 && !request.use_combined_context()
@@ -966,6 +1008,7 @@ mod tests {
     use cognee_database::ops as db_ops;
     use cognee_database::{AclDb, IngestDb};
     use cognee_database::{SearchHistoryDb, SearchHistoryEntryType, connect, initialize};
+    use cognee_llm::Message;
     use cognee_models::Dataset;
     use cognee_session::SessionContext;
     use serde_json::json;
@@ -1329,6 +1372,104 @@ mod tests {
 
         assert_eq!(context_map[&dataset_a.to_string()].len(), 1);
         assert_eq!(context_map[&dataset_b.to_string()].len(), 1);
+    }
+
+    /// `only_context` over several datasets builds one prompt per dataset,
+    /// each from that dataset's own context, keyed like `response.context`;
+    /// the top-level prompt is the first dataset's. A dataset with no context
+    /// gets no prompt.
+    #[tokio::test]
+    async fn only_context_builds_one_prompt_per_dataset() {
+        let dataset_a = uuid::Uuid::new_v4();
+        let dataset_b = uuid::Uuid::new_v4();
+        let dataset_c = uuid::Uuid::new_v4();
+
+        struct PromptingRetriever {
+            datasets: [uuid::Uuid; 2],
+        }
+
+        #[async_trait]
+        impl SearchRetriever for PromptingRetriever {
+            fn search_type(&self) -> SearchType {
+                SearchType::RagCompletion
+            }
+
+            async fn get_context(
+                &self,
+                _query: &str,
+                _params: &SearchParams,
+            ) -> Result<SearchContext, SearchError> {
+                Ok(self
+                    .datasets
+                    .iter()
+                    .map(|dataset| crate::types::SearchItem {
+                        id: None,
+                        score: Some(0.9),
+                        payload: json!({
+                            "dataset_id": dataset.to_string(),
+                            "text": format!("text of {dataset}"),
+                        }),
+                    })
+                    .collect())
+            }
+
+            async fn completion_messages(
+                &self,
+                _query: &str,
+                context: &SearchContext,
+                _session: &SessionContext,
+                _params: &SearchParams,
+            ) -> Result<Option<Vec<Message>>, SearchError> {
+                let texts: Vec<&str> = context
+                    .iter()
+                    .filter_map(|item| item.payload["text"].as_str())
+                    .collect();
+                Ok(Some(vec![
+                    Message::system("system"),
+                    Message::user(texts.join("|")),
+                ]))
+            }
+
+            async fn get_completion(
+                &self,
+                _query: &str,
+                _context: Option<SearchContext>,
+                _session: &SessionContext,
+                _params: &SearchParams,
+            ) -> Result<SearchOutput, SearchError> {
+                Ok(SearchOutput::Text("unused".to_string()))
+            }
+        }
+
+        let mut registry = SearchTypeRegistry::new();
+        registry.register(Arc::new(PromptingRetriever {
+            datasets: [dataset_a, dataset_b],
+        }));
+        let orchestrator = super::SearchOrchestrator::new(registry);
+
+        let mut request: SearchRequest =
+            serde_json::from_value(json!({ "query_text": "hello" })).unwrap();
+        request.search_type = SearchType::RagCompletion;
+        request.only_context = Some(true);
+        request.dataset_ids = Some(vec![dataset_a, dataset_b, dataset_c]);
+
+        let response = orchestrator.search(&request).await.unwrap();
+
+        let prompts = response.prompts.expect("one prompt per dataset");
+        assert_eq!(prompts.len(), 2, "dataset C has no context, so no prompt");
+        assert_eq!(
+            prompts[&dataset_a.to_string()].user_prompt,
+            format!("text of {dataset_a}")
+        );
+        assert_eq!(
+            prompts[&dataset_b.to_string()].user_prompt,
+            format!("text of {dataset_b}")
+        );
+        assert_eq!(
+            response.user_prompt.as_deref(),
+            Some(prompts[&dataset_a.to_string()].user_prompt.as_str()),
+            "the top-level prompt is the first dataset's"
+        );
     }
 
     #[tokio::test]

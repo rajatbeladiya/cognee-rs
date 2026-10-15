@@ -290,6 +290,12 @@ export interface CogneeSearchResponse {
   user_prompt?: string | null;
   /** The system message paired with `user_prompt`; set and null together. */
   system_prompt?: string | null;
+  /**
+   * With `only_context` over several datasets (not combined): each dataset's
+   * own prompt, keyed by dataset id like `context`. A dataset with no context
+   * has no entry; `user_prompt` is the first dataset's.
+   */
+  prompts?: Record<string, { user_prompt: string; system_prompt: string }> | null;
 }
 
 /**
