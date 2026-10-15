@@ -11,7 +11,10 @@ use cognee_session::SessionContext;
 use crate::retrievers::SearchRetriever;
 use crate::retrievers::context_items::search_results_to_context;
 use crate::types::{SearchContext, SearchError, SearchOutput, SearchParams, SearchType};
-use crate::utils::{build_messages_with_history, render_user_prompt, resolve_system_prompt};
+use crate::utils::{
+    build_messages_with_history, render_user_prompt, resolve_system_prompt,
+    skip_completion_on_empty_context,
+};
 
 const TRIPLET_DATA_TYPE: &str = "Triplet";
 const TRIPLET_PRIMARY_FIELD: &str = "text";
@@ -137,6 +140,10 @@ impl SearchRetriever for TripletRetriever {
         };
 
         let context_text = Self::context_to_text(&completion_context);
+
+        if context_text.is_empty() {
+            return Ok(skip_completion_on_empty_context());
+        }
 
         let system_prompt = resolve_system_prompt(
             params
@@ -493,5 +500,43 @@ mod tests {
         assert_eq!(messages.len(), 2);
         assert!(messages[1].content.contains("Alice knows Bob"));
         assert!(messages[1].content.contains("who knows Bob?"));
+    }
+
+    /// An existing but empty triplet collection is a normal miss: no LLM call
+    /// (Python's `skip_completion_on_empty_context`, `triplet_retriever.py:
+    /// 214-219`).
+    #[tokio::test]
+    async fn empty_context_skips_the_llm() {
+        let llm = Arc::new(TestLlm {
+            response_text: "phantom answer".to_string(),
+            ..Default::default()
+        });
+
+        let retriever = TripletRetriever::new(
+            Arc::new(TestVectorDb {
+                collections: HashMap::from([(TestVectorDb::key("Triplet", "text"), vec![])]),
+                searched_fields: Mutex::new(vec![]),
+            }),
+            Arc::new(TestEmbeddingEngine),
+            Arc::clone(&llm) as Arc<dyn Llm>,
+            Some(2),
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let output = retriever
+            .get_completion(
+                "who knows Bob?",
+                None,
+                &SessionContext::default(),
+                &SearchParams::default(),
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(output, SearchOutput::Texts(ref texts) if texts.is_empty()));
+        assert!(llm.last_messages.lock().unwrap().is_empty(), "no LLM call");
     }
 }

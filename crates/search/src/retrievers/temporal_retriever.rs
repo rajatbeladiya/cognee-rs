@@ -228,6 +228,7 @@ impl TemporalRetriever {
                     "target_text": edge.target_text,
                     "source_description": edge.source_description,
                     "target_description": edge.target_description,
+                    "edge_text": edge.edge_text,
                 }),
             })
             .collect()
@@ -2435,6 +2436,7 @@ mod tests {
             target_text: None,
             source_description: None,
             target_description: None,
+            edge_text: None,
         }
     }
 

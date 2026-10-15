@@ -131,6 +131,9 @@ pub struct RankedGraphEdge {
     pub source_description: Option<String>,
     /// Description of the target node (present on Entity nodes).
     pub target_description: Option<String>,
+    /// The edge's nonblank `edge_text` property — its natural-language
+    /// description, rendered after the relationship in the graph context.
+    pub edge_text: Option<String>,
 }
 
 #[tracing::instrument(
@@ -392,12 +395,14 @@ pub async fn brute_force_triplet_search(
             // are blank — cognify skips building a row for such an edge, so there
             // is nothing to match and the penalty is correct.
             // Unmatched edge types get the default penalty distance.
-            let edge_dist = edge_type_point_id(
-                properties.get("edge_text").and_then(|v| v.as_str()),
-                &relationship_name,
-            )
-            .and_then(|point_id| edge_type_distances.get(&point_id).copied())
-            .unwrap_or(default_penalty);
+            let edge_text = properties
+                .get("edge_text")
+                .and_then(|v| v.as_str())
+                .filter(|text| !text.trim().is_empty())
+                .map(str::to_string);
+            let edge_dist = edge_type_point_id(edge_text.as_deref(), &relationship_name)
+                .and_then(|point_id| edge_type_distances.get(&point_id).copied())
+                .unwrap_or(default_penalty);
 
             let source_name = node_names
                 .get(&source_id)
@@ -446,6 +451,7 @@ pub async fn brute_force_triplet_search(
                 target_text,
                 source_description,
                 target_description,
+                edge_text,
             })
         })
         .collect::<Vec<_>>();

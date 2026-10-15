@@ -118,6 +118,7 @@ impl GraphRetrieverCore {
                     "target_text": edge.target_text,
                     "source_description": edge.source_description,
                     "target_description": edge.target_description,
+                    "edge_text": edge.edge_text,
                 }),
             })
             .collect())

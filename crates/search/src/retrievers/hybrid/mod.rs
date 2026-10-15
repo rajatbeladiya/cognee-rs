@@ -56,9 +56,9 @@ use crate::types::{
     SearchContext, SearchError, SearchItem, SearchOutput, SearchParams, SearchType,
 };
 use crate::utils::{
-    DEFAULT_HYBRID_USER_PROMPT_TEMPLATE, HYBRID_SMALL_WINDOW_SYSTEM_PROMPT,
+    DEFAULT_HYBRID_USER_PROMPT_TEMPLATE, EMPTY_GRAPH_MESSAGE, HYBRID_SMALL_WINDOW_SYSTEM_PROMPT,
     HYBRID_SMALL_WINDOW_USER_PROMPT_TEMPLATE, build_messages_with_history, render_user_prompt,
-    resolve_system_prompt,
+    resolve_system_prompt, skip_completion_on_empty_context,
 };
 
 /// Top-k for the chunks/entities/facts lanes when neither a per-lane knob nor
@@ -787,10 +787,7 @@ impl SearchRetriever for HybridRetriever {
         // this is the default search type — it must not answer a fresh install
         // with an empty context while the other completion types report it.
         if self.graph_db.is_empty().await? {
-            return Err(SearchError::NotFound(
-                "The knowledge graph is empty. Ingest data through Cognee before searching."
-                    .to_string(),
-            ));
+            return Err(SearchError::NotFound(EMPTY_GRAPH_MESSAGE.to_string()));
         }
 
         // Embed the query once and share the vector across both lanes.
@@ -940,8 +937,7 @@ impl SearchRetriever for HybridRetriever {
         // deflection. No completion, no session turn — `Texts([])` is not the
         // `Text` the orchestrator records a QA turn for.
         if context_text.is_empty() {
-            warn!("Empty context: skipping LLM completion, returning no results");
-            return Ok(SearchOutput::Texts(Vec::new()));
+            return Ok(skip_completion_on_empty_context());
         }
 
         // Passages that did not fit and have no summary yet: ask the answering

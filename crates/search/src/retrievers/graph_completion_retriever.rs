@@ -18,8 +18,8 @@ use crate::types::{
     SearchContext, SearchError, SearchItem, SearchOutput, SearchParams, SearchType,
 };
 use crate::utils::{
-    build_messages_with_history, render_edges_context, render_graph_user_prompt,
-    resolve_system_prompt,
+    EMPTY_GRAPH_MESSAGE, build_messages_with_history, render_edges_context,
+    render_graph_user_prompt, resolve_system_prompt, skip_completion_on_empty_context,
 };
 
 const DEFAULT_TOP_K: usize = 10;
@@ -107,9 +107,12 @@ impl SearchRetriever for GraphCompletionRetriever {
         query: &str,
         params: &SearchParams,
     ) -> Result<SearchContext, SearchError> {
+        // Python raises `NoDataError` here (`graph_completion_retriever.py:
+        // 139-148`, SDK-270): an empty graph is a state problem, not a query
+        // miss. A populated graph with no matching triplets still returns an
+        // empty context below. Same error and message as the hybrid retriever.
         if self.graph_db.is_empty().await? {
-            debug!("graph is empty — returning empty context");
-            return Ok(vec![]);
+            return Err(SearchError::NotFound(EMPTY_GRAPH_MESSAGE.to_string()));
         }
 
         let config = GraphRetrievalConfig {
@@ -152,6 +155,7 @@ impl SearchRetriever for GraphCompletionRetriever {
                     "target_text": edge.target_text,
                     "source_description": edge.source_description,
                     "target_description": edge.target_description,
+                    "edge_text": edge.edge_text,
                     "dataset_id": edge.dataset_id,
                 }),
             })
@@ -171,6 +175,10 @@ impl SearchRetriever for GraphCompletionRetriever {
         };
 
         let graph_context_text = render_edges_context(&completion_context);
+
+        if graph_context_text.is_empty() {
+            return Ok(skip_completion_on_empty_context());
+        }
 
         let system_prompt = resolve_system_prompt(
             params
@@ -246,7 +254,7 @@ mod tests {
     use cognee_session::SessionContext;
 
     use crate::retrievers::{GraphCompletionRetriever, SearchRetriever};
-    use crate::types::{SearchOutput, SearchParams};
+    use crate::types::{SearchError, SearchOutput, SearchParams};
 
     struct TestEmbeddingEngine;
 
@@ -764,5 +772,160 @@ mod tests {
         assert!(messages[1].content.contains("knowledge graph"));
         // Should NOT use the generic RAG format
         assert!(!messages[1].content.starts_with("Question:\n"));
+    }
+
+    fn retriever_over(
+        graph_db: TestGraphDb,
+        collections: HashMap<String, Vec<SearchResult>>,
+        llm: &Arc<TestLlm>,
+    ) -> GraphCompletionRetriever {
+        GraphCompletionRetriever::new(
+            Arc::new(TestVectorDb { collections }),
+            Arc::new(TestEmbeddingEngine),
+            Arc::new(graph_db),
+            Arc::clone(llm) as Arc<dyn Llm>,
+            Some(2),
+            Some(5),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    /// Python raises `NoDataError` on an empty graph (SDK-270); the Rust
+    /// counterpart is `NotFound`, the same error the hybrid retriever raises.
+    #[tokio::test]
+    async fn empty_graph_is_not_found() {
+        let llm = Arc::new(TestLlm::default());
+        let retriever = retriever_over(
+            TestGraphDb {
+                empty: true,
+                nodes: vec![],
+                edges: vec![],
+            },
+            HashMap::new(),
+            &llm,
+        );
+
+        let err = retriever
+            .get_context("query", &SearchParams::default())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, SearchError::NotFound(ref message) if message.contains("knowledge graph is empty")),
+            "expected NotFound, got {err:?}"
+        );
+
+        // Through get_completion the error surfaces before any LLM call.
+        let err = retriever
+            .get_completion(
+                "query",
+                None,
+                &SessionContext::default(),
+                &SearchParams::default(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SearchError::NotFound(_)));
+        assert!(llm.last_messages.lock().unwrap().is_empty(), "no LLM call");
+    }
+
+    /// A populated graph with no matching triplet is a normal miss: no error,
+    /// and no LLM call — Python's `skip_completion_on_empty_context`.
+    #[tokio::test]
+    async fn empty_context_skips_the_llm() {
+        let llm = Arc::new(TestLlm {
+            response_text: "phantom answer".to_string(),
+            ..Default::default()
+        });
+        let retriever = retriever_over(
+            TestGraphDb {
+                empty: false,
+                nodes: vec![],
+                edges: vec![],
+            },
+            HashMap::new(),
+            &llm,
+        );
+
+        let context = retriever
+            .get_context("query", &SearchParams::default())
+            .await
+            .unwrap();
+        assert!(context.is_empty());
+
+        let output = retriever
+            .get_completion(
+                "query",
+                Some(context),
+                &SessionContext::default(),
+                &SearchParams::default(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(output, SearchOutput::Texts(ref texts) if texts.is_empty()));
+        assert!(llm.last_messages.lock().unwrap().is_empty(), "no LLM call");
+    }
+
+    /// The edge's `edge_text` property rides into the context payload and is
+    /// rendered after the relationship in the prompt (`resolve_edges_to_text.py:
+    /// 79-100`).
+    #[tokio::test]
+    async fn edge_text_reaches_the_prompt() {
+        let alice = "00000000-0000-0000-0000-000000000001";
+        let acme = "00000000-0000-0000-0000-000000000002";
+        let llm = Arc::new(TestLlm {
+            response_text: "answer".to_string(),
+            ..Default::default()
+        });
+        let retriever = retriever_over(
+            TestGraphDb {
+                empty: false,
+                nodes: vec![node(alice, "Alice"), node(acme, "Acme")],
+                edges: vec![(
+                    alice.to_string(),
+                    acme.to_string(),
+                    "works_at".to_string(),
+                    HashMap::from([(
+                        Cow::Borrowed("edge_text"),
+                        json!("Alice has worked at Acme since 2019"),
+                    )]),
+                )],
+            },
+            HashMap::from([(
+                TestVectorDb::key("Entity", "name"),
+                vec![entity_hit(alice, 0.9)],
+            )]),
+            &llm,
+        );
+
+        let context = retriever
+            .get_context("query", &SearchParams::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            context[0].payload["edge_text"],
+            "Alice has worked at Acme since 2019"
+        );
+
+        retriever
+            .get_completion(
+                "query",
+                Some(context),
+                &SessionContext::default(),
+                &SearchParams::default(),
+            )
+            .await
+            .unwrap();
+        let messages = llm.last_messages.lock().unwrap().clone();
+        assert!(
+            messages[1]
+                .content
+                .contains("Alice --[works_at]--> Acme  (Alice has worked at Acme since 2019)"),
+            "got: {}",
+            messages[1].content
+        );
     }
 }

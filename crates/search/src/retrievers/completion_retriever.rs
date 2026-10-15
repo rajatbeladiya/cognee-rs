@@ -11,7 +11,10 @@ use cognee_session::SessionContext;
 use crate::retrievers::SearchRetriever;
 use crate::retrievers::context_items::search_results_to_context;
 use crate::types::{SearchContext, SearchError, SearchOutput, SearchParams, SearchType};
-use crate::utils::{build_messages_with_history, render_user_prompt, resolve_system_prompt};
+use crate::utils::{
+    build_messages_with_history, render_user_prompt, resolve_system_prompt,
+    skip_completion_on_empty_context,
+};
 
 const CHUNKS_DATA_TYPE: &str = "DocumentChunk";
 const CHUNKS_FIELD_NAME: &str = "text";
@@ -109,6 +112,10 @@ impl SearchRetriever for CompletionRetriever {
             .filter_map(|item| item.payload.get("text").and_then(|value| value.as_str()))
             .collect::<Vec<_>>()
             .join("\n");
+
+        if context_text.is_empty() {
+            return Ok(skip_completion_on_empty_context());
+        }
 
         let system_prompt = resolve_system_prompt(
             params
@@ -451,5 +458,43 @@ mod tests {
         let messages = llm.last_messages.lock().unwrap().clone();
         assert_eq!(messages[0].content, "custom system prompt");
         assert!(messages[1].content.contains("Q=who?; C=provided chunk"));
+    }
+
+    /// An existing but empty chunk collection is a normal miss: no LLM call
+    /// (Python's `skip_completion_on_empty_context`, `completion_retriever.py:
+    /// 265-270`).
+    #[tokio::test]
+    async fn empty_context_skips_the_llm() {
+        let llm = Arc::new(TestLlm {
+            response_text: "phantom answer".to_string(),
+            ..Default::default()
+        });
+
+        let retriever = CompletionRetriever::new(
+            Arc::new(TestVectorDb {
+                has_collection: true,
+                results: vec![],
+            }),
+            Arc::new(TestEmbeddingEngine),
+            Arc::clone(&llm) as Arc<dyn Llm>,
+            Some(2),
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let output = retriever
+            .get_completion(
+                "what happened?",
+                None,
+                &SessionContext::default(),
+                &SearchParams::default(),
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(output, SearchOutput::Texts(ref texts) if texts.is_empty()));
+        assert!(llm.last_messages.lock().unwrap().is_empty(), "no LLM call");
     }
 }
