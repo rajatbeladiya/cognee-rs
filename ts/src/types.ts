@@ -154,7 +154,11 @@ export interface CogneeSearchOptions {
   nodeName?: string[];
   /** How `nodeName` combines: `"OR"` (any name, default) or `"AND"` (all names). */
   nodeNameFilterOperator?: "AND" | "OR";
-  /** Return only the context without running completion. */
+  /**
+   * Skip the completion and return what the LLM would have received: the
+   * response's `user_prompt` / `system_prompt` (the result is the user prompt)
+   * for the completion types, else the bare context.
+   */
   onlyContext?: boolean;
   /** Combine context from multiple retrieval paths. */
   useCombinedContext?: boolean;
@@ -278,6 +282,14 @@ export interface CogneeSearchResponse {
   only_context: boolean;
   use_combined_context: boolean;
   verbose: boolean;
+  /**
+   * With `only_context`: the user message the completion would have sent (also
+   * the `result`, as `Text`). Null when the retriever sends no single templated
+   * prompt or retrieval found nothing — `result` is then the bare context.
+   */
+  user_prompt?: string | null;
+  /** The system message paired with `user_prompt`; set and null together. */
+  system_prompt?: string | null;
 }
 
 /**

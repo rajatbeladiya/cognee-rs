@@ -68,6 +68,18 @@ pub struct SearchResponse {
     pub only_context: bool,
     pub use_combined_context: bool,
     pub verbose: bool,
+    /// The user message an `only_context` search stands in for: the question
+    /// and the retrieved context rendered through the retriever's template.
+    /// Also the `result` (as `Text`) when set. `None` unless `only_context`
+    /// is on, the retriever sends one templated prompt, and retrieval found
+    /// something — Python's `SearchResultPayload.user_prompt`.
+    #[serde(default)]
+    pub user_prompt: Option<String>,
+    /// The system message that goes with [`user_prompt`](Self::user_prompt);
+    /// set and unset with it. Carries the session history when a session is
+    /// active, since that is where the Rust completion sends it.
+    #[serde(default)]
+    pub system_prompt: Option<String>,
 }
 
 impl SearchResponse {
@@ -82,6 +94,8 @@ impl SearchResponse {
             only_context: false,
             use_combined_context: false,
             verbose: false,
+            user_prompt: None,
+            system_prompt: None,
         }
     }
 }

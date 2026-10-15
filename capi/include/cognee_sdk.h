@@ -498,7 +498,9 @@ void cg_sdk_add_and_cognify(const CgSdk*        sdk,
  *   "nodeType"              — string
  *   "nodeName"              — string array
  *   "nodeNameFilterOperator" — "OR" (default) or "AND"
- *   "onlyContext"           — boolean
+ *   "onlyContext"           — boolean; skip the LLM and return what it would
+ *                             have received ("user_prompt"/"system_prompt"),
+ *                             or the bare context for non-completion types
  *   "useCombinedContext"    — boolean
  *   "verbose"               — boolean
  *   "saveInteraction"       — boolean (default true, matching Python SDK)

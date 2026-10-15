@@ -77,6 +77,8 @@ pub fn prepare_search_result(
         only_context,
         use_combined_context,
         verbose,
+        user_prompt: None,
+        system_prompt: None,
     }
 }
 

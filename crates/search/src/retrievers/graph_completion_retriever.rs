@@ -3,7 +3,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use cognee_embedding::EmbeddingEngine;
 use cognee_graph::GraphDBTrait;
-use cognee_llm::{GenerationOptions, Llm};
+use cognee_llm::{GenerationOptions, Llm, Message};
 use cognee_vector::VectorDB;
 use serde_json::json;
 use tracing::debug;
@@ -42,6 +42,51 @@ pub struct GraphCompletionRetriever {
 }
 
 impl GraphCompletionRetriever {
+    /// The system + user messages a completion over `context` sends, or
+    /// `None` when the rendered context is empty. Shared by `get_completion`
+    /// and the `only_context` preview.
+    fn build_completion_messages(
+        &self,
+        query: &str,
+        context: &SearchContext,
+        session: &SessionContext,
+        params: &SearchParams,
+    ) -> Result<Option<Vec<Message>>, SearchError> {
+        let graph_context_text = render_edges_context(context);
+        if graph_context_text.is_empty() {
+            return Ok(None);
+        }
+
+        let system_prompt = resolve_system_prompt(
+            params
+                .system_prompt
+                .as_deref()
+                .or(self.system_prompt.as_deref()),
+            params
+                .system_prompt_path
+                .as_deref()
+                .or(self.system_prompt_path.as_deref()),
+        )?;
+
+        let user_prompt = render_graph_user_prompt(
+            self.user_prompt_template.as_deref(),
+            query,
+            &graph_context_text,
+        );
+
+        debug!(
+            context_items = context.len(),
+            "Graph context assembled:\n{graph_context_text}"
+        );
+        debug!("LLM user prompt:\n{user_prompt}");
+
+        Ok(Some(build_messages_with_history(
+            system_prompt,
+            user_prompt,
+            session,
+        )))
+    }
+
     /// Cap the neighbours expanded per seed node in triplet search
     /// (`search.triplet_neighbor_cap`); `None` is uncapped.
     #[must_use]
@@ -162,6 +207,16 @@ impl SearchRetriever for GraphCompletionRetriever {
             .collect())
     }
 
+    async fn completion_messages(
+        &self,
+        query: &str,
+        context: &SearchContext,
+        session: &SessionContext,
+        params: &SearchParams,
+    ) -> Result<Option<Vec<Message>>, SearchError> {
+        self.build_completion_messages(query, context, session, params)
+    }
+
     async fn get_completion(
         &self,
         query: &str,
@@ -174,36 +229,11 @@ impl SearchRetriever for GraphCompletionRetriever {
             None => self.get_context(query, params).await?,
         };
 
-        let graph_context_text = render_edges_context(&completion_context);
-
-        if graph_context_text.is_empty() {
+        let Some(messages) =
+            self.build_completion_messages(query, &completion_context, session, params)?
+        else {
             return Ok(skip_completion_on_empty_context());
-        }
-
-        let system_prompt = resolve_system_prompt(
-            params
-                .system_prompt
-                .as_deref()
-                .or(self.system_prompt.as_deref()),
-            params
-                .system_prompt_path
-                .as_deref()
-                .or(self.system_prompt_path.as_deref()),
-        )?;
-
-        let user_prompt = render_graph_user_prompt(
-            self.user_prompt_template.as_deref(),
-            query,
-            &graph_context_text,
-        );
-
-        debug!(
-            context_items = completion_context.len(),
-            "Graph context assembled:\n{graph_context_text}"
-        );
-        debug!("LLM user prompt:\n{user_prompt}");
-
-        let messages = build_messages_with_history(system_prompt, user_prompt, session);
+        };
 
         if let Some(schema) = &params.response_schema {
             let structured_value = self

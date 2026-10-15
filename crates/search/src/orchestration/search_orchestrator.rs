@@ -6,7 +6,7 @@ use crate::types::{
 };
 use crate::utils::detect_feedback;
 use cognee_database::{AclDb, IngestDb, SearchHistoryDb, SearchHistoryEntry};
-use cognee_llm::Llm;
+use cognee_llm::{Llm, Message, MessageRole};
 use cognee_session::{SessionContext, SessionManager, UsedGraphElementIds};
 use std::sync::Arc;
 
@@ -96,6 +96,22 @@ fn apply_context_char_limit(gc: &str, max_chars: Option<usize>) -> &str {
 ///   (`hybrid/context.py:33-58`), which returns `node_ids` alone.
 ///
 /// The result shape matches Python's `UsedGraphElementIds` dict.
+/// The `(user_prompt, system_prompt)` pair out of a completion's messages —
+/// the two fields an `only_context` response carries.
+fn split_prompt_messages(messages: Option<Vec<Message>>) -> (Option<String>, Option<String>) {
+    let Some(messages) = messages else {
+        return (None, None);
+    };
+    let pick = |role: MessageRole| {
+        messages
+            .iter()
+            .rev()
+            .find(|message| message.role == role)
+            .map(|message| message.content.clone())
+    };
+    (pick(MessageRole::User), pick(MessageRole::System))
+}
+
 fn build_used_graph_element_ids(
     context: Option<&[crate::types::SearchItem]>,
 ) -> Option<UsedGraphElementIds> {
@@ -630,15 +646,46 @@ impl SearchOrchestrator {
 
         if request.only_context() {
             let output_context = context.unwrap_or_default();
+
+            // What the completion would have sent instead of the bare context
+            // (Python's `build_only_context_prompt`, `only_context_prompt.py`):
+            // the same messages, built by the same code, with the session read
+            // as it stands — no LLM call and no session write. Only built when
+            // retrieval found something, so a miss stays detectable and pays
+            // no session read.
+            let messages = if output_context.is_empty() {
+                None
+            } else {
+                let session_context = self.load_session_context(request).await;
+                retriever
+                    .completion_messages(
+                        &request.query_text,
+                        &output_context,
+                        &session_context,
+                        &params,
+                    )
+                    .await?
+            };
+            let (user_prompt, system_prompt) = split_prompt_messages(messages);
+
+            // Python's `SearchResultPayload.result`: the user prompt when one
+            // was built (the system prompt travels separately), else the
+            // context.
+            let result = match &user_prompt {
+                Some(prompt) => SearchOutput::Text(prompt.clone()),
+                None => SearchOutput::Items(output_context.clone()),
+            };
             let mut response = prepare_search_result(
                 request.search_type,
-                SearchOutput::Items(output_context.clone()),
+                result,
                 Some(output_context),
                 request.dataset_ids.clone(),
                 true,
                 request.use_combined_context(),
                 request.verbose(),
             );
+            response.user_prompt = user_prompt;
+            response.system_prompt = system_prompt;
 
             if let Some(scoped_context_map) = scoped_contexts
                 && !request.use_combined_context()
@@ -654,45 +701,7 @@ impl SearchOrchestrator {
         }
 
         let user_id_str = request.user_id.map(|id| id.to_string());
-        let session_context = if let (Some(session_id), Some(sm)) =
-            (&request.session_id, &self.session_manager)
-        {
-            let (history, formatted_history) = sm
-                .load_history_both(Some(session_id), user_id_str.as_deref())
-                .await
-                .unwrap_or_default();
-
-            // Prepend graph knowledge snapshot (from improve() sync) if available.
-            // Matches Python `session_manager.py:435-450`:
-            //   "Background knowledge from the knowledge graph:\n" + gc + "\n\n" + history
-            let graph_context = sm
-                .get_graph_context(Some(session_id), user_id_str.as_deref())
-                .await
-                .ok()
-                .flatten();
-            let formatted_history = if let Some(gc) =
-                graph_context.as_deref().filter(|s| !s.is_empty())
-            {
-                let gc = apply_context_char_limit(gc, None);
-                format!(
-                    "Background knowledge from the knowledge graph:\n{gc}\n\n{formatted_history}"
-                )
-            } else {
-                formatted_history
-            };
-
-            SessionContext {
-                session_id: Some(session_id.clone()),
-                history,
-                formatted_history,
-                graph_context,
-            }
-        } else {
-            SessionContext {
-                session_id: request.session_id.clone(),
-                ..SessionContext::default()
-            }
-        };
+        let session_context = self.load_session_context(request).await;
 
         // Look up the latest QA id for the session. This is used by both the
         // auto-feedback path (to write feedback to the prior entry) and by the
@@ -877,6 +886,49 @@ impl SearchOrchestrator {
 
         emit_search_completed(request);
         Ok(response)
+    }
+
+    /// The session layer a completion carries: the conversation history,
+    /// prefixed by the graph-knowledge snapshot when one exists. Read-only.
+    async fn load_session_context(&self, request: &SearchRequest) -> SessionContext {
+        let user_id_str = request.user_id.map(|id| id.to_string());
+        if let (Some(session_id), Some(sm)) = (&request.session_id, &self.session_manager) {
+            let (history, formatted_history) = sm
+                .load_history_both(Some(session_id), user_id_str.as_deref())
+                .await
+                .unwrap_or_default();
+
+            // Prepend graph knowledge snapshot (from improve() sync) if available.
+            // Matches Python `session_manager.py:435-450`:
+            //   "Background knowledge from the knowledge graph:\n" + gc + "\n\n" + history
+            let graph_context = sm
+                .get_graph_context(Some(session_id), user_id_str.as_deref())
+                .await
+                .ok()
+                .flatten();
+            let formatted_history = if let Some(gc) =
+                graph_context.as_deref().filter(|s| !s.is_empty())
+            {
+                let gc = apply_context_char_limit(gc, None);
+                format!(
+                    "Background knowledge from the knowledge graph:\n{gc}\n\n{formatted_history}"
+                )
+            } else {
+                formatted_history
+            };
+
+            SessionContext {
+                session_id: Some(session_id.clone()),
+                history,
+                formatted_history,
+                graph_context,
+            }
+        } else {
+            SessionContext {
+                session_id: request.session_id.clone(),
+                ..SessionContext::default()
+            }
+        }
     }
 
     async fn log_result_if_enabled(
