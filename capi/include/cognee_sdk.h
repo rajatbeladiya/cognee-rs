@@ -497,6 +497,7 @@ void cg_sdk_add_and_cognify(const CgSdk*        sdk,
  *   "sessionId"             — string
  *   "nodeType"              — string
  *   "nodeName"              — string array
+ *   "nodeNameFilterOperator" — "OR" (default) or "AND"
  *   "onlyContext"           — boolean
  *   "useCombinedContext"    — boolean
  *   "verbose"               — boolean

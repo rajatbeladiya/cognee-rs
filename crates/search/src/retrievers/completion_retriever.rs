@@ -9,7 +9,7 @@ use tracing::debug;
 use cognee_session::SessionContext;
 
 use crate::retrievers::SearchRetriever;
-use crate::retrievers::context_items::search_results_to_context;
+use crate::retrievers::context_items::search_node_filtered;
 use crate::types::{SearchContext, SearchError, SearchOutput, SearchParams, SearchType};
 use crate::utils::{
     build_messages_with_history, render_user_prompt, resolve_system_prompt,
@@ -82,17 +82,16 @@ impl SearchRetriever for CompletionRetriever {
             SearchError::InvalidInput("embedding engine returned no vectors".to_string())
         })?;
 
-        let results = self
-            .vector_db
-            .search_similar(
-                CHUNKS_DATA_TYPE,
-                CHUNKS_FIELD_NAME,
-                &query_vector,
-                params.top_k_or(self.top_k),
-            )
-            .await?;
-
-        search_results_to_context(results)
+        search_node_filtered(
+            self.vector_db.as_ref(),
+            CHUNKS_DATA_TYPE,
+            CHUNKS_FIELD_NAME,
+            &query_vector,
+            params.top_k_or(self.top_k),
+            params.node_name.as_deref(),
+            params.node_name_filter_operator.as_deref().unwrap_or("OR"),
+        )
+        .await
     }
 
     async fn get_completion(
@@ -496,5 +495,65 @@ mod tests {
 
         assert!(matches!(output, SearchOutput::Texts(ref texts) if texts.is_empty()));
         assert!(llm.last_messages.lock().unwrap().is_empty(), "no LLM call");
+    }
+
+    /// RAG scopes its chunk search by `node_name` like Python's
+    /// `CompletionRetriever` (`completion_retriever.py:136-144`): only in-set
+    /// chunks reach the prompt.
+    #[tokio::test]
+    async fn node_name_scopes_the_rag_context() {
+        use cognee_vector::VectorPoint;
+
+        let db = cognee_vector::BruteForceVectorDB::new();
+        db.create_collection("DocumentChunk", "text", 2)
+            .await
+            .unwrap();
+        let point = |text: &str, sets: &[&str]| VectorPoint {
+            id: Uuid::new_v4(),
+            vector: vec![1.0, 0.0],
+            metadata: HashMap::from([
+                ("text".to_string(), json!(text)),
+                ("belongs_to_set".to_string(), json!(sets)),
+            ]),
+        };
+        db.index_points(
+            "DocumentChunk",
+            "text",
+            &[
+                point("in both sets", &["x", "y"]),
+                point("only in x", &["x"]),
+            ],
+        )
+        .await
+        .unwrap();
+
+        let llm = Arc::new(TestLlm {
+            response_text: "answer".to_string(),
+            ..Default::default()
+        });
+        let retriever = CompletionRetriever::new(
+            Arc::new(db),
+            Arc::new(TestEmbeddingEngine),
+            Arc::clone(&llm) as Arc<dyn Llm>,
+            Some(10),
+            None,
+            None,
+            None,
+            None,
+        );
+        let params = SearchParams {
+            node_name: Some(vec!["x".to_string(), "y".to_string()]),
+            node_name_filter_operator: Some("AND".to_string()),
+            ..SearchParams::default()
+        };
+
+        retriever
+            .get_completion("q", None, &SessionContext::default(), &params)
+            .await
+            .unwrap();
+
+        let prompt = llm.last_messages.lock().unwrap()[1].content.clone();
+        assert!(prompt.contains("in both sets"), "got: {prompt}");
+        assert!(!prompt.contains("only in x"), "got: {prompt}");
     }
 }

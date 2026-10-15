@@ -48,6 +48,7 @@ use crate::sdk_ops::parse_c_str_or_fire;
 ///   "sessionId"              — string
 ///   "nodeType"               — string
 ///   "nodeName"               — string array
+///   "nodeNameFilterOperator" — "OR" (default) or "AND"
 ///   "onlyContext"            — boolean
 ///   "useCombinedContext"     — boolean
 ///   "verbose"                — boolean

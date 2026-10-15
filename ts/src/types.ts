@@ -152,6 +152,8 @@ export interface CogneeSearchOptions {
   nodeType?: string;
   /** Filter results by one or more node names. */
   nodeName?: string[];
+  /** How `nodeName` combines: `"OR"` (any name, default) or `"AND"` (all names). */
+  nodeNameFilterOperator?: "AND" | "OR";
   /** Return only the context without running completion. */
   onlyContext?: boolean;
   /** Combine context from multiple retrieval paths. */
