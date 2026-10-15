@@ -67,6 +67,23 @@ pub fn filter_context_to_datasets(context: &SearchContext, dataset_ids: &[Uuid])
         .collect()
 }
 
+/// `context` narrowed to `params.dataset_ids` when the request has a dataset
+/// scope; unchanged otherwise.
+///
+/// For retrievers that fetch **more** context inside `get_completion`
+/// (context extension, chain-of-thought follow-ups): the orchestrator filters
+/// only the context it fetches itself, so a follow-up retrieval must apply the
+/// scope on its own or the answer draws on datasets outside it.
+pub(crate) fn filter_context_to_params(
+    context: SearchContext,
+    params: &crate::types::SearchParams,
+) -> SearchContext {
+    match params.dataset_ids.as_deref() {
+        Some(scope) if !scope.is_empty() => filter_context_to_datasets(&context, scope),
+        _ => context,
+    }
+}
+
 pub fn merge_scoped_contexts(scoped_contexts: &HashMap<String, SearchContext>) -> SearchContext {
     let mut seen = HashSet::new();
     let mut merged = Vec::new();
@@ -212,5 +229,42 @@ mod tests {
             .map(|i| i.payload["text"].as_str().unwrap())
             .collect();
         assert_eq!(texts, vec!["B", "CA", "A"]);
+    }
+
+    #[test]
+    fn filter_context_to_params_applies_only_a_non_empty_scope() {
+        let dataset_a = Uuid::new_v4();
+        let context = vec![
+            SearchItem {
+                id: None,
+                score: None,
+                payload: json!({"dataset_id": dataset_a.to_string(), "text": "A"}),
+            },
+            SearchItem {
+                id: None,
+                score: None,
+                payload: json!({"dataset_id": Uuid::new_v4().to_string(), "text": "other"}),
+            },
+        ];
+        let scoped = crate::types::SearchParams {
+            dataset_ids: Some(vec![dataset_a]),
+            ..Default::default()
+        };
+        assert_eq!(
+            super::filter_context_to_params(context.clone(), &scoped).len(),
+            1
+        );
+        for unscoped in [
+            crate::types::SearchParams::default(),
+            crate::types::SearchParams {
+                dataset_ids: Some(vec![]),
+                ..Default::default()
+            },
+        ] {
+            assert_eq!(
+                super::filter_context_to_params(context.clone(), &unscoped).len(),
+                2
+            );
+        }
     }
 }

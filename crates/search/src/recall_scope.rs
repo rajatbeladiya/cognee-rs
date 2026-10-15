@@ -454,22 +454,18 @@ pub async fn run_graph(
     // `authorized_search(dataset_ids=...)`), so it needs the caller's identity
     // on the request. Recall's `user_id` is a string because the session
     // helpers key on strings; the graph side needs the UUID form. A non-UUID
-    // caller id matters when a dataset filter is in play, or when the
-    // orchestrator has an ACL wired: then even an unfiltered search is scoped
-    // to the datasets the caller may read (Python's `authorized_search` with
-    // `dataset_ids=None`), which needs the caller's identity. Otherwise the
-    // graph search has no owner scope to apply and the value is simply not
-    // forwarded, as before.
-    let needs_caller = datasets.as_ref().is_some_and(|d| !d.is_empty())
-        || dataset_ids.as_ref().is_some_and(|d| !d.is_empty())
-        || search_orchestrator.has_acl_db();
+    // caller id with a dataset filter is the caller's mistake and is reported
+    // as such. Without a filter the graph search has no owner scope to apply
+    // and the value is simply not forwarded, as before.
+    let has_dataset_filter = datasets.as_ref().is_some_and(|d| !d.is_empty())
+        || dataset_ids.as_ref().is_some_and(|d| !d.is_empty());
     let owner_id: Option<Uuid> = match user_id {
         None => None,
         Some(raw) => match Uuid::parse_str(raw) {
             Ok(id) => Some(id),
-            Err(error) if needs_caller => {
+            Err(error) if has_dataset_filter => {
                 return Err(SearchError::InvalidInput(format!(
-                    "a dataset filter or access control requires a UUID user_id to identify the caller, \
+                    "dataset filter requires a UUID user_id to identify the owner, \
                      got '{raw}': {error}"
                 )));
             }
@@ -499,6 +495,28 @@ pub async fn run_graph(
     };
 
     span.record(COGNEE_SEARCH_TYPE, format!("{search_type:?}").as_str());
+
+    // With access control wired, an unfiltered graph search covers the
+    // datasets the caller may read, which needs a caller. With none (or one
+    // that is not a UUID) there is nothing the caller can be shown to read, so
+    // the graph source contributes nothing — the same answer as a caller who
+    // may read no dataset (Python: zero per-dataset tasks, `[]`). It is not an
+    // error: recall's other sources (session, trace, graph context) and its
+    // auto-mode fall-through still run. Python has no such case, since
+    // `recall()` resolves a missing user to the default user first.
+    if search_orchestrator.has_acl_db() && owner_id.is_none() && !has_dataset_filter {
+        debug!("recall: access control is wired and the caller is unknown; no graph results");
+        let response = crate::orchestration::prepare_search_result(
+            search_type,
+            crate::SearchOutput::Items(Vec::new()),
+            None,
+            Some(Vec::new()),
+            false,
+            false,
+            false,
+        );
+        return Ok((Vec::new(), search_type, auto_routed, response));
+    }
 
     let request = SearchRequest {
         query_text: query_text.to_string(),
@@ -773,6 +791,11 @@ mod tests {
     impl SearchRetriever for RecordingRetriever {
         fn search_type(&self) -> SearchType {
             SearchType::Chunks
+        }
+
+        fn dataset_scoping(&self) -> crate::retrievers::DatasetScoping {
+            // Fixture items carry `dataset_id`.
+            crate::retrievers::DatasetScoping::Membership
         }
 
         async fn get_context(
@@ -1073,9 +1096,10 @@ mod tests {
     }
 
     /// With an ACL wired, an unfiltered recall by a caller who may read
-    /// nothing returns no graph items and never runs the retriever; a caller
-    /// id that is not a UUID cannot be authorized and is rejected even
-    /// without a filter.
+    /// nothing returns no graph items and never runs the retriever. An unknown
+    /// caller (no id, or one that is not a UUID) gets the same empty graph
+    /// result, not an error, so recall's other sources and its auto-mode
+    /// fall-through keep working.
     #[tokio::test]
     async fn run_graph_unfiltered_with_acl_and_nothing_readable_is_empty() {
         let owner = Uuid::new_v4();
@@ -1107,21 +1131,24 @@ mod tests {
             "retriever must not run when the caller may read no dataset"
         );
 
-        let err = run_graph(
-            "anything",
-            Some(SearchType::Chunks),
-            None,
-            None,
-            5,
-            false,
-            None,
-            Some("user-1"),
-            &orchestrator,
-            &span,
-            None,
-        )
-        .await
-        .expect_err("a non-UUID caller cannot be authorized under ACL");
-        assert!(matches!(err, SearchError::InvalidInput(_)), "got {err:?}");
+        for caller in [None, Some("user-1")] {
+            let (items, _used, _auto, _response) = run_graph(
+                "anything",
+                Some(SearchType::Chunks),
+                None,
+                None,
+                5,
+                false,
+                None,
+                caller,
+                &orchestrator,
+                &span,
+                None,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("unknown caller {caller:?}: {e:?}"));
+            assert!(items.is_empty(), "caller {caller:?}: {items:?}");
+        }
+        assert!(retriever.seen.lock().expect("test mutex").is_none());
     }
 }

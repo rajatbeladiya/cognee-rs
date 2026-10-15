@@ -402,6 +402,10 @@ impl SearchRetriever for FeedbackRetriever {
         SearchType::Feedback
     }
 
+    fn dataset_scoping(&self) -> super::DatasetScoping {
+        super::DatasetScoping::NotDatasetData
+    }
+
     async fn get_context(
         &self,
         query: &str,

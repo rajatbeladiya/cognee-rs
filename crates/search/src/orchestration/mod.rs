@@ -7,6 +7,7 @@ mod search_type_tools;
 pub const CONTEXT_LABEL_COMBINED: &str = "combined";
 pub const CONTEXT_LABEL_DEFAULT: &str = "default";
 
+pub(crate) use dataset_scope::filter_context_to_params;
 pub use dataset_scope::{
     filter_context_to_datasets, merge_scoped_contexts, scope_context_by_datasets,
 };
