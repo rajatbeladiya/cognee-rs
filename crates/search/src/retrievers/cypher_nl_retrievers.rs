@@ -3,6 +3,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use cognee_graph::GraphDBTrait;
 use cognee_llm::{GenerationOptions, Llm, Message};
+use cognee_models::{INTERNAL_PROPERTY, is_internal_node};
 use cognee_session::SessionContext;
 use serde_json::{Value, json};
 
@@ -91,6 +92,40 @@ fn ensure_cypher_queries_enabled(allowed: bool) -> Result<(), SearchError> {
              ALLOW_CYPHER_QUERY=false)"
                 .to_string(),
         ))
+    }
+}
+
+/// True for a node-schema row that describes internal nodes — one whose
+/// collected property list holds the `is_internal` key.
+///
+/// Port of `_is_internal_schema_row` (`natural_language_retriever.py:16-37`).
+/// On backends with per-node property keys (Neo4j) internal nodes are the only
+/// ones carrying the key; on fixed-column backends (Ladybug/Kuzu) the marker
+/// lives inside the serialized properties and this is a no-op.
+fn is_internal_schema_row(row: &[Value]) -> bool {
+    row.iter().any(|value| match value {
+        Value::String(s) => s == INTERNAL_PROPERTY,
+        Value::Array(items) => items
+            .iter()
+            .any(|item| item.as_str() == Some(INTERNAL_PROPERTY)),
+        _ => false,
+    })
+}
+
+/// True when a raw query-result value contains an internal graph node:
+/// a node object marked `is_internal` at any depth, or a serialized JSON node
+/// in a string column (Ladybug/Kuzu raw rows).
+///
+/// Port of `_contains_internal_node` (`natural_language_retriever.py:40-58`).
+fn contains_internal_node(value: &Value) -> bool {
+    match value {
+        Value::Object(map) => is_internal_node(map) || map.values().any(contains_internal_node),
+        Value::Array(items) => items.iter().any(contains_internal_node),
+        Value::String(s) if s.contains(INTERNAL_PROPERTY) => serde_json::from_str::<Value>(s)
+            .ok()
+            .and_then(|parsed| parsed.as_object().map(is_internal_node))
+            .unwrap_or(false),
+        _ => false,
     }
 }
 
@@ -237,6 +272,14 @@ impl NaturalLanguageRetriever {
             )
             .await?;
 
+        // Internal nodes (e.g. Python's per-user preference state) must never
+        // be surfaced, so their labels stay out of the schema
+        // (`natural_language_retriever.py:106-108`).
+        let node_schemas = node_schemas
+            .into_iter()
+            .filter(|row| !is_internal_schema_row(row))
+            .collect();
+
         Ok((node_schemas, edge_schemas))
     }
 
@@ -293,7 +336,15 @@ impl NaturalLanguageRetriever {
                 continue;
             }
 
-            match self.graph_db.query(&cypher_query, None).await {
+            // Drop every row that contains an internal node
+            // (`natural_language_retriever.py:145-148`); a query left with no
+            // rows counts as an empty result and is retried.
+            let filtered = self.graph_db.query(&cypher_query, None).await.map(|rows| {
+                rows.into_iter()
+                    .filter(|row| !row.iter().any(contains_internal_node))
+                    .collect::<Vec<_>>()
+            });
+            match filtered {
                 Ok(context) if !context.is_empty() => return Ok(context),
                 Ok(_) => {
                     any_query_executed = true;
@@ -921,5 +972,96 @@ mod tests {
         assert!(NL_SYSTEM_PROMPT_TEMPLATE.contains("DocumentChunk"));
         assert!(NL_SYSTEM_PROMPT_TEMPLATE.contains("TextSummary"));
         assert!(NL_SYSTEM_PROMPT_TEMPLATE.contains("Example 1:"));
+    }
+
+    const NODE_SCHEMA_QUERY: &str = "\n            MATCH (n)\n            UNWIND keys(n) AS prop\n            RETURN DISTINCT labels(n) AS NodeLabels, collect(DISTINCT prop) AS Properties;\n            ";
+    const EDGE_SCHEMA_QUERY: &str = "\n            MATCH ()-[r]->()\n            UNWIND keys(r) AS key\n            RETURN DISTINCT key;\n            ";
+
+    #[test]
+    fn internal_schema_rows_are_recognized() {
+        use super::is_internal_schema_row;
+
+        assert!(is_internal_schema_row(&[
+            json!(["UserPreference"]),
+            json!(["id", "is_internal"])
+        ]));
+        assert!(!is_internal_schema_row(&[
+            json!(["Entity"]),
+            json!(["id", "name"])
+        ]));
+    }
+
+    #[test]
+    fn internal_nodes_are_found_at_any_depth_and_in_serialized_columns() {
+        use super::contains_internal_node;
+
+        assert!(contains_internal_node(&json!({ "is_internal": true })));
+        assert!(contains_internal_node(
+            &json!([{ "n": { "is_internal": true } }])
+        ));
+        // Ladybug/Kuzu: node properties come back as a JSON string column.
+        assert!(contains_internal_node(&json!(
+            r#"{"id": "p1", "is_internal": true}"#
+        )));
+        assert!(!contains_internal_node(&json!({ "is_internal": false })));
+        assert!(!contains_internal_node(&json!({ "name": "Alice" })));
+        // A string that merely mentions the key is not a node.
+        assert!(!contains_internal_node(&json!("about is_internal")));
+    }
+
+    /// Rows holding an internal node are dropped from NATURAL_LANGUAGE results
+    /// (`natural_language_retriever.py:145-148`); a query left with no rows is
+    /// retried like any empty result.
+    #[tokio::test]
+    async fn natural_language_retriever_hides_internal_nodes() {
+        let graph_db = Arc::new(TestGraphDb {
+            empty: false,
+            reject_unseeded: false,
+            rows_by_query: std::collections::HashMap::from([
+                (
+                    NODE_SCHEMA_QUERY.to_string(),
+                    vec![
+                        vec![json!(["Entity"]), json!(["name"])],
+                        vec![json!(["UserPreference"]), json!(["is_internal"])],
+                    ],
+                ),
+                (
+                    EDGE_SCHEMA_QUERY.to_string(),
+                    vec![vec![json!("relationship")]],
+                ),
+                (
+                    "MATCH (p:UserPreference) RETURN p".to_string(),
+                    vec![vec![json!({ "id": "pref", "is_internal": true })]],
+                ),
+                (
+                    "MATCH (n) RETURN n".to_string(),
+                    vec![
+                        vec![json!({ "name": "Alice" })],
+                        vec![json!({ "id": "pref", "is_internal": true })],
+                    ],
+                ),
+            ]),
+        });
+
+        let llm = Arc::new(TestLlm::new(vec![
+            "MATCH (p:UserPreference) RETURN p",
+            "MATCH (n) RETURN n",
+        ]));
+
+        let retriever = NaturalLanguageRetriever::new(graph_db, llm, Some(3), None);
+        let output = retriever
+            .get_completion(
+                "What is in the graph?",
+                None,
+                &SessionContext::default(),
+                &SearchParams::default(),
+            )
+            .await
+            .unwrap();
+
+        let SearchOutput::GraphQueryRows(rows) = output else {
+            panic!("expected graph query rows");
+        };
+        assert_eq!(rows, vec![vec![json!({ "name": "Alice" })]]);
     }
 }
