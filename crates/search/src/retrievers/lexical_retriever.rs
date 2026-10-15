@@ -6,11 +6,12 @@
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex};
 
 use async_trait::async_trait;
 use cognee_graph::GraphDBTrait;
 use cognee_session::SessionContext;
+use regex::Regex;
 use serde_json::{Value, json};
 
 use crate::retrievers::SearchRetriever;
@@ -38,33 +39,55 @@ pub enum LexicalScorer {
     Jaccard { multiset: bool },
 }
 
-struct CachedChunk {
+/// A `DocumentChunk` node as one search loaded it.
+struct LoadedChunk {
     id: Option<uuid::Uuid>,
     payload: serde_json::Value,
-    tokens: Vec<String>,
+    text: String,
 }
 
-/// One search's snapshot of the chunk corpus, with the BM25 statistics
-/// computed once from it (`bm25_retriever.py:_build_corpus_stats`).
+/// The tokenized corpus, with the BM25 statistics computed once from it
+/// (`bm25_retriever.py:_build_corpus_stats`).
+///
+/// Built from one load's chunk list and reused while a later load fingerprints
+/// the same: tokenizing every chunk and rebuilding the IDF table is the
+/// expensive part of a lexical search, and it only changes when the chunks do.
 struct Corpus {
-    chunks: Vec<CachedChunk>,
+    /// Indices into the load's chunk list of the chunks that produced tokens.
+    kept: Vec<usize>,
+    /// Tokens of each kept chunk, aligned with `kept`.
+    tokens: Vec<Vec<String>>,
+    /// BM25 statistics; empty for a Jaccard scorer, which never reads them.
     idf: HashMap<String, f32>,
     avg_chunk_length: f32,
 }
 
 impl Corpus {
-    fn new(chunks: Vec<CachedChunk>) -> Self {
-        let total_chunks = chunks.len() as f32;
+    fn new(kept: Vec<usize>, tokens: Vec<Vec<String>>, with_bm25_stats: bool) -> Self {
+        let mut corpus = Self {
+            kept,
+            tokens,
+            idf: HashMap::new(),
+            avg_chunk_length: 0.0,
+        };
+        if with_bm25_stats {
+            corpus.build_bm25_stats();
+        }
+        corpus
+    }
+
+    fn build_bm25_stats(&mut self) {
+        let total_chunks = self.tokens.len() as f32;
         let mut document_frequency: HashMap<&str, usize> = HashMap::new();
         let mut total_length = 0usize;
-        for chunk in &chunks {
-            total_length += chunk.tokens.len();
-            let unique: HashSet<&str> = chunk.tokens.iter().map(String::as_str).collect();
+        for tokens in &self.tokens {
+            total_length += tokens.len();
+            let unique: HashSet<&str> = tokens.iter().map(String::as_str).collect();
             for token in unique {
                 *document_frequency.entry(token).or_default() += 1;
             }
         }
-        let idf = document_frequency
+        self.idf = document_frequency
             .into_iter()
             .map(|(token, df)| {
                 let df = df as f32;
@@ -74,16 +97,11 @@ impl Corpus {
                 )
             })
             .collect();
-        let avg_chunk_length = if chunks.is_empty() {
+        self.avg_chunk_length = if self.tokens.is_empty() {
             0.0
         } else {
             total_length as f32 / total_chunks
         };
-        Self {
-            chunks,
-            idf,
-            avg_chunk_length,
-        }
     }
 
     /// Okapi BM25 of one chunk, summed over the unique query terms
@@ -111,12 +129,35 @@ impl Corpus {
     }
 }
 
+/// Fingerprint of a chunk list: ids and texts, in load order. Equal
+/// fingerprints mean the cached tokens and statistics still describe it.
+fn fingerprint(chunks: &[LoadedChunk]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    chunks.len().hash(&mut hasher);
+    for chunk in chunks {
+        chunk.id.hash(&mut hasher);
+        chunk.text.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+/// Python's `\w` over `str`: a character `str.isalnum()` accepts — letters
+/// (`L*`) and numbers (`N*`) — or the underscore. Unlike Rust's
+/// `char::is_alphanumeric`, this excludes combining marks such as Devanagari
+/// vowel signs, which Python's `\w` does not match.
+static WORD: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"[\p{L}\p{N}_]+").expect("the word pattern is a valid regex"));
+
 pub struct LexicalRetriever {
     graph_db: Arc<dyn GraphDBTrait>,
     top_k: usize,
     with_scores: bool,
     stop_words: HashSet<String>,
     scorer: LexicalScorer,
+    /// The last corpus built, keyed by the fingerprint of the chunk list it
+    /// was built from.
+    corpus_cache: Mutex<Option<(u64, Arc<Corpus>)>>,
 }
 
 impl LexicalRetriever {
@@ -137,6 +178,7 @@ impl LexicalRetriever {
             scorer: LexicalScorer::Jaccard {
                 multiset: multiset_jaccard,
             },
+            corpus_cache: Mutex::new(None),
         }
     }
 
@@ -161,6 +203,7 @@ impl LexicalRetriever {
                 k1: BM25_DEFAULT_K1,
                 b: BM25_DEFAULT_B,
             },
+            corpus_cache: Mutex::new(None),
         }
     }
 
@@ -170,28 +213,16 @@ impl LexicalRetriever {
     }
 
     /// Lowercase, split on word characters, drop stop words — Python's
-    /// `tokenize_words` (`re.findall(r"\w+", text.lower())`).
+    /// `tokenize_words`: `re.findall(r"\w+", text.lower())`. The whole text is
+    /// lowercased first, as `str.lower()` does, so context-dependent mappings
+    /// (a word-final `Σ` becomes `ς`) match Python.
     fn tokenize(&self, text: &str) -> Vec<String> {
-        let mut tokens = Vec::new();
-        let mut current = String::new();
-
-        for ch in text.chars() {
-            if ch.is_alphanumeric() || ch == '_' {
-                current.extend(ch.to_lowercase());
-            } else if !current.is_empty() {
-                if !self.stop_words.contains(&current) {
-                    tokens.push(std::mem::take(&mut current));
-                } else {
-                    current.clear();
-                }
-            }
-        }
-
-        if !current.is_empty() && !self.stop_words.contains(&current) {
-            tokens.push(current);
-        }
-
-        tokens
+        let lowered = text.to_lowercase();
+        WORD.find_iter(&lowered)
+            .map(|word| word.as_str())
+            .filter(|word| !self.stop_words.contains(*word))
+            .map(str::to_string)
+            .collect()
     }
 
     fn score(&self, corpus: &Corpus, query_tokens: &[String], chunk_tokens: &[String]) -> f32 {
@@ -201,9 +232,7 @@ impl LexicalRetriever {
         }
     }
 
-    async fn load_document_chunks(
-        &self,
-    ) -> Result<Vec<(Option<uuid::Uuid>, Value, String)>, SearchError> {
+    async fn load_document_chunks(&self) -> Result<Vec<LoadedChunk>, SearchError> {
         let filters = HashMap::from([(Cow::Borrowed("type"), vec![json!(DOCUMENT_CHUNK_TYPE)])]);
 
         let (nodes, _) = self.graph_db.get_filtered_graph_data(&filters).await?;
@@ -224,47 +253,72 @@ impl LexicalRetriever {
 
             let payload = serde_json::to_value(&node_data)?;
 
-            let item_id = node_data
+            let id = node_data
                 .get("id")
                 .and_then(Value::as_str)
                 .and_then(|id| uuid::Uuid::parse_str(id).ok())
                 .or_else(|| uuid::Uuid::parse_str(&node_id).ok());
 
-            chunks.push((item_id, payload, text.to_string()));
+            chunks.push(LoadedChunk {
+                id,
+                payload,
+                text: text.to_string(),
+            });
         }
 
         Ok(chunks)
     }
 
-    /// Load and tokenize the chunk corpus.
+    /// Load the chunks and the tokenized corpus over them.
     ///
-    /// Done once per search, not once per retriever: Python builds a fresh
-    /// retriever for every search (`get_search_type_retriever_instance.py`),
-    /// while this one lives as long as its orchestrator — a binding handle's
-    /// lifetime. A corpus cached here would keep serving the chunks (and BM25
-    /// statistics) from before a later `add` + `cognify`.
+    /// The chunks are read on every search: Python builds a fresh retriever
+    /// per search (`get_search_type_retriever_instance.py`), while this one
+    /// lives as long as its orchestrator — a binding handle's lifetime — and
+    /// the graph exposes no change signal, so a cached chunk list would keep
+    /// serving the chunks from before a later `add` + `cognify`. The expensive
+    /// part — tokenizing and the BM25 statistics — is cached and reused while
+    /// the chunk list's fingerprint is unchanged.
     ///
     /// No usable chunk is Python's `NoDataError` (`lexical_retriever.py:90-92`).
-    async fn load_corpus(&self) -> Result<Corpus, SearchError> {
-        let chunks: Vec<CachedChunk> = self
-            .load_document_chunks()
-            .await?
-            .into_iter()
-            .filter_map(|(id, payload, text)| {
-                let tokens = self.tokenize(&text);
-                (!tokens.is_empty()).then_some(CachedChunk {
-                    id,
-                    payload,
+    async fn load_corpus(&self) -> Result<(Vec<LoadedChunk>, Arc<Corpus>), SearchError> {
+        let chunks = self.load_document_chunks().await?;
+        let key = fingerprint(&chunks);
+
+        let cached = self
+            .corpus_cache
+            .lock()
+            .unwrap() // lock poison is unrecoverable
+            .as_ref()
+            .filter(|(cached_key, _)| *cached_key == key)
+            .map(|(_, corpus)| Arc::clone(corpus));
+        let corpus = match cached {
+            Some(corpus) => corpus,
+            None => {
+                let (kept, tokens): (Vec<usize>, Vec<Vec<String>>) = chunks
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, chunk)| {
+                        let tokens = self.tokenize(&chunk.text);
+                        (!tokens.is_empty()).then_some((index, tokens))
+                    })
+                    .unzip();
+                let corpus = Arc::new(Corpus::new(
+                    kept,
                     tokens,
-                })
-            })
-            .collect();
-        if chunks.is_empty() {
+                    matches!(self.scorer, LexicalScorer::Bm25 { .. }),
+                ));
+                *self.corpus_cache.lock().unwrap() = // lock poison is unrecoverable
+                    Some((key, Arc::clone(&corpus)));
+                corpus
+            }
+        };
+
+        if corpus.kept.is_empty() {
             return Err(SearchError::NotFound(
                 "No valid chunks loaded during initialization.".to_string(),
             ));
         }
-        Ok(Corpus::new(chunks))
+        Ok((chunks, corpus))
     }
 }
 
@@ -332,7 +386,7 @@ impl SearchRetriever for LexicalRetriever {
         query: &str,
         params: &SearchParams,
     ) -> Result<SearchContext, SearchError> {
-        let corpus = self.load_corpus().await?;
+        let (chunks, corpus) = self.load_corpus().await?;
 
         let query_tokens = self.tokenize(query);
         if query_tokens.is_empty() {
@@ -340,13 +394,14 @@ impl SearchRetriever for LexicalRetriever {
         }
 
         let mut items_with_score = corpus
-            .chunks
+            .kept
             .iter()
-            .map(|chunk| {
-                let score = self.score(&corpus, &query_tokens, &chunk.tokens);
+            .zip(&corpus.tokens)
+            .map(|(&index, tokens)| {
+                let chunk = &chunks[index];
                 SearchItem {
                     id: chunk.id,
-                    score: Some(score),
+                    score: Some(self.score(&corpus, &query_tokens, tokens)),
                     payload: chunk.payload.clone(),
                 }
             })
@@ -720,5 +775,53 @@ mod tests {
             }
             _ => panic!("expected items output"),
         }
+    }
+
+    /// Golden tokens from Python's `re.findall(r"\w+", text.lower())`:
+    /// Devanagari vowel signs split words (they are not `\w`), a word-final
+    /// `Σ` lowercases to `ς`, and number characters are word characters.
+    #[test]
+    fn tokenize_matches_python_word_characters() {
+        let graph_db: Arc<dyn GraphDBTrait> = Arc::new(MockGraphDB::new());
+        let retriever = LexicalRetriever::new(graph_db, None, false, None, false);
+
+        assert_eq!(
+            retriever.tokenize("किताब ΟΔΟΣ ab_c Ⅻ ½"),
+            vec!["क", "त", "ब", "οδος", "ab_c", "ⅻ", "½"]
+        );
+    }
+
+    /// The tokenized corpus is reused while the chunks are unchanged, and
+    /// rebuilt as soon as one is added.
+    #[tokio::test]
+    async fn corpus_is_reused_until_the_chunks_change() {
+        let mock_graph_db = Arc::new(MockGraphDB::new());
+        add_chunk(&mock_graph_db, "rust ownership").await;
+        let graph_db: Arc<dyn GraphDBTrait> = Arc::clone(&mock_graph_db) as _;
+        let retriever = LexicalRetriever::bm25(graph_db, Some(5), false, None);
+
+        let (_, first) = retriever.load_corpus().await.unwrap();
+        let (_, second) = retriever.load_corpus().await.unwrap();
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "unchanged chunks reuse the corpus"
+        );
+
+        add_chunk(&mock_graph_db, "python async").await;
+        let (_, third) = retriever.load_corpus().await.unwrap();
+        assert!(!Arc::ptr_eq(&second, &third), "a new chunk rebuilds it");
+        assert_eq!(third.tokens.len(), 2);
+    }
+
+    /// Jaccard never reads the BM25 statistics, so they are not built for it.
+    #[tokio::test]
+    async fn jaccard_builds_no_bm25_statistics() {
+        let mock_graph_db = Arc::new(MockGraphDB::new());
+        add_chunk(&mock_graph_db, "rust ownership").await;
+        let graph_db: Arc<dyn GraphDBTrait> = mock_graph_db;
+        let retriever = LexicalRetriever::new(graph_db, Some(5), false, None, false);
+
+        let (_, corpus) = retriever.load_corpus().await.unwrap();
+        assert!(corpus.idf.is_empty());
     }
 }
