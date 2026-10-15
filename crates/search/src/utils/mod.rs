@@ -15,5 +15,6 @@ pub use completion::{
 };
 pub(crate) use edge_type_id::edge_type_point_id;
 pub use feedback_detection::detect_feedback;
+pub(crate) use resolve_edges_to_text::DEFAULT_STOP_WORDS;
 pub use resolve_edges_to_text::resolve_edges_to_text as render_edges_context;
 pub use session_messages::build_messages_with_history;
