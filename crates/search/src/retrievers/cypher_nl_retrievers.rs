@@ -292,7 +292,15 @@ impl NaturalLanguageRetriever {
         let edge_schema_text = serde_json::to_string(edge_schemas)?;
         let system_prompt = NL_SYSTEM_PROMPT_TEMPLATE
             .replace("{edge_schemas}", &edge_schema_text)
-            .replace("{previous_attempts}", previous_attempts);
+            // Python: `previous_attempts or "No attempts yet"`.
+            .replace(
+                "{previous_attempts}",
+                if previous_attempts.is_empty() {
+                    "No attempts yet"
+                } else {
+                    previous_attempts
+                },
+            );
 
         let response = self
             .llm
@@ -310,7 +318,7 @@ impl NaturalLanguageRetriever {
 
     async fn execute_nl_query(&self, query: &str) -> Result<Vec<Vec<Value>>, SearchError> {
         let (_node_schemas, edge_schemas) = self.get_graph_schema().await?;
-        let mut previous_attempts = String::from("No attempts yet.");
+        let mut previous_attempts = String::new();
         // Track whether any generated query actually executed against the graph
         // (Ok, even with zero rows) versus every one being rejected. See the
         // fail-loudly branch after the loop.
@@ -325,14 +333,14 @@ impl NaturalLanguageRetriever {
                 Ok(cq) => cq,
                 Err(error) => {
                     previous_attempts.push_str(&format!(
-                        "Query: Not generated -> Executed with error: {error}\\n"
+                        "Query: Not generated -> Executed with error: {error}\n"
                     ));
                     continue;
                 }
             };
 
             if cypher_query.is_empty() {
-                previous_attempts.push_str("Query: <empty> -> Result: None\\n");
+                previous_attempts.push_str("Query: <empty> -> Result: None\n");
                 continue;
             }
 
@@ -348,13 +356,12 @@ impl NaturalLanguageRetriever {
                 Ok(context) if !context.is_empty() => return Ok(context),
                 Ok(_) => {
                     any_query_executed = true;
-                    previous_attempts
-                        .push_str(&format!("Query: {cypher_query} -> Result: None\\n"));
+                    previous_attempts.push_str(&format!("Query: {cypher_query} -> Result: None\n"));
                 }
                 Err(error) => {
                     last_query_error = Some(error.to_string());
                     previous_attempts.push_str(&format!(
-                        "Query: {cypher_query} -> Executed with error: {error}\\n"
+                        "Query: {cypher_query} -> Executed with error: {error}\n"
                     ));
                 }
             }
@@ -606,6 +613,8 @@ mod tests {
 
     struct TestLlm {
         responses: Mutex<VecDeque<String>>,
+        /// The system prompt of every call, in order.
+        system_prompts: Mutex<Vec<String>>,
     }
 
     impl TestLlm {
@@ -617,6 +626,7 @@ mod tests {
                         .map(ToString::to_string)
                         .collect::<VecDeque<_>>(),
                 ),
+                system_prompts: Mutex::new(vec![]),
             }
         }
     }
@@ -625,9 +635,13 @@ mod tests {
     impl Llm for TestLlm {
         async fn generate(
             &self,
-            _messages: Vec<Message>,
+            messages: Vec<Message>,
             _options: Option<GenerationOptions>,
         ) -> LlmResult<GenerationResponse> {
+            self.system_prompts
+                .lock()
+                .unwrap()
+                .push(messages[0].content.clone());
             Ok(GenerationResponse {
                 content: self
                     .responses
@@ -1048,7 +1062,12 @@ mod tests {
             "MATCH (n) RETURN n",
         ]));
 
-        let retriever = NaturalLanguageRetriever::new(graph_db, llm, Some(3), None);
+        let retriever = NaturalLanguageRetriever::new(
+            graph_db,
+            Arc::clone(&llm) as Arc<dyn Llm>,
+            Some(3),
+            None,
+        );
         let output = retriever
             .get_completion(
                 "What is in the graph?",
@@ -1063,5 +1082,17 @@ mod tests {
             panic!("expected graph query rows");
         };
         assert_eq!(rows, vec![vec![json!({ "name": "Alice" })]]);
+
+        // The retry prompt lists the failed attempt on its own line, after
+        // Python's "No attempts yet" placeholder has been replaced.
+        let prompts = llm.system_prompts.lock().unwrap().clone();
+        assert!(prompts[0].contains("No attempts yet"));
+        assert!(
+            prompts[1].contains("Query: MATCH (p:UserPreference) RETURN p -> Result: None\n"),
+            "got: {}",
+            prompts[1]
+        );
+        assert!(!prompts[1].contains("No attempts yet"));
+        assert!(!prompts[1].contains("\\n"), "no literal backslash-n");
     }
 }
