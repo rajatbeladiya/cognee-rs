@@ -33,7 +33,7 @@ pub use retrievers::{
     DatasetScoping, FeedbackRetriever, FeelingLuckyRetriever,
     GraphCompletionContextExtensionRetriever, GraphCompletionCotRetriever,
     GraphCompletionRetriever, GraphSummaryCompletionRetriever, HybridBudget, HybridRetriever,
-    LexicalRetriever, NaturalLanguageRetriever, SearchRetriever, SearchRetrieverRef,
+    LexicalRetriever, LexicalScorer, NaturalLanguageRetriever, SearchRetriever, SearchRetrieverRef,
     SummariesRetriever, TemporalRetriever, TripletRetriever,
 };
 pub use types::{
