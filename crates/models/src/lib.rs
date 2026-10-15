@@ -36,7 +36,7 @@ pub use embedding::Embedding;
 pub use entity::Entity;
 pub use entity_type::EntityType;
 pub use has_datapoint::HasDataPoint;
-pub use internal_node::{INTERNAL_PROPERTY, is_internal_node};
+pub use internal_node::{INTERNAL_PROPERTY, is_internal_node, marks_internal};
 pub use memory::{FeedbackEntry, MemoryEntry, QAEntry, TraceEntry};
 pub use permission::permissions;
 pub use temporal_event::*;

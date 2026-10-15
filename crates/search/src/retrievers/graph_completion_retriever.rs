@@ -857,4 +857,50 @@ mod tests {
             messages[1].content
         );
     }
+
+    /// Internal nodes (Python's `InternalDataPoint`) are never projected, so
+    /// no edge touching one reaches the context (`CogneeGraph.py:192-232`).
+    #[tokio::test]
+    async fn internal_nodes_never_reach_the_context() {
+        let alice = "00000000-0000-0000-0000-000000000001";
+        let acme = "00000000-0000-0000-0000-000000000002";
+        let preference = "00000000-0000-0000-0000-000000000003";
+        let mut internal = node(preference, "Alice prefers terse answers");
+        internal.1.insert(Cow::Borrowed("is_internal"), json!(true));
+
+        let llm = Arc::new(TestLlm::default());
+        let retriever = retriever_over(
+            TestGraphDb {
+                empty: false,
+                nodes: vec![node(alice, "Alice"), node(acme, "Acme"), internal],
+                edges: vec![
+                    (
+                        alice.to_string(),
+                        acme.to_string(),
+                        "works_at".to_string(),
+                        HashMap::new(),
+                    ),
+                    (
+                        alice.to_string(),
+                        preference.to_string(),
+                        "prefers".to_string(),
+                        HashMap::new(),
+                    ),
+                ],
+            },
+            HashMap::from([(
+                TestVectorDb::key("Entity", "name"),
+                vec![entity_hit(alice, 0.9), entity_hit(preference, 0.95)],
+            )]),
+            &llm,
+        );
+
+        let context = retriever
+            .get_context("query", &SearchParams::default())
+            .await
+            .unwrap();
+
+        assert_eq!(context.len(), 1, "only the non-internal edge: {context:?}");
+        assert_eq!(context[0].payload["relationship"], "works_at");
+    }
 }

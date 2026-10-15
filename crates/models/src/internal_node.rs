@@ -18,7 +18,13 @@ pub const INTERNAL_PROPERTY: &str = "is_internal";
 /// follows Python truthiness: `false`, `0`, `""`, `[]`, `{}` and `null` are
 /// not internal.
 pub fn is_internal_node(properties: &Map<String, Value>) -> bool {
-    properties.get(INTERNAL_PROPERTY).is_some_and(is_truthy)
+    marks_internal(properties.get(INTERNAL_PROPERTY))
+}
+
+/// True when a node's `is_internal` property value (absent: `None`) marks it
+/// internal — [`is_internal_node`] for property maps of any shape.
+pub fn marks_internal(value: Option<&Value>) -> bool {
+    value.is_some_and(is_truthy)
 }
 
 fn is_truthy(value: &Value) -> bool {
