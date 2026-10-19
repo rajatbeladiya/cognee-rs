@@ -37,9 +37,11 @@ describe("datasets.has() with a non-UUID id (repro)", () => {
     await expect(c.datasets.has("nonexistent-id")).resolves.toBe(false);
   });
 
-  it("returns false for a valid but unknown UUID", async () => {
+  // A valid UUID that is not one of the caller's datasets is refused, like
+  // Python's `datasets.has_data` (PermissionDeniedError) — SDK-936.
+  it("rejects a valid but unknown UUID", async () => {
     await expect(
       c.datasets.has("00000000-0000-0000-0000-000000000001")
-    ).resolves.toBe(false);
+    ).rejects.toThrow();
   });
 });
