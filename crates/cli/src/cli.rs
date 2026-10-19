@@ -242,9 +242,10 @@ pub struct PipelineUnblockArgs {
     #[arg(long = "clear", default_value_t = false)]
     pub clear: bool,
 
-    /// Tenant the dataset belongs to (the one the blocked run used). Datasets are matched by strict tenant equality: a
-    /// dataset added with `--tenant-id T` is found only with `--tenant-id T`;
-    /// without the flag only tenant-less datasets are reachable.
+    /// Tenant the dataset belongs to (the one the blocked run used). Datasets are
+    /// matched by strict tenant equality: a dataset added with `--tenant-id T` is
+    /// found only with `--tenant-id T`; without the flag only tenant-less datasets
+    /// are reachable.
     #[arg(long = "tenant-id")]
     pub tenant_id: Option<String>,
 }
@@ -363,9 +364,10 @@ pub struct MemifyArgs {
     #[arg(long = "batch-size", default_value_t = 100)]
     pub batch_size: usize,
 
-    /// Tenant to run as; without `--datasets`, memify runs on the owner's datasets in this tenant. Datasets are matched by strict tenant equality: a
-    /// dataset added with `--tenant-id T` is found only with `--tenant-id T`;
-    /// without the flag only tenant-less datasets are reachable.
+    /// Tenant to run as; without `--datasets`, memify runs on the owner's datasets
+    /// in this tenant. Datasets are matched by strict tenant equality: a dataset
+    /// added with `--tenant-id T` is found only with `--tenant-id T`; without the
+    /// flag only tenant-less datasets are reachable.
     #[arg(long = "tenant-id")]
     pub tenant_id: Option<String>,
 }
@@ -429,9 +431,10 @@ pub struct CognifyArgs {
     #[arg(long = "temporal-cognify", default_value_t = false)]
     pub temporal_cognify: bool,
 
-    /// Tenant to run as; without `--datasets`, cognify runs on the owner's datasets in this tenant. Datasets are matched by strict tenant equality: a
-    /// dataset added with `--tenant-id T` is found only with `--tenant-id T`;
-    /// without the flag only tenant-less datasets are reachable.
+    /// Tenant to run as; without `--datasets`, cognify runs on the owner's datasets
+    /// in this tenant. Datasets are matched by strict tenant equality: a dataset
+    /// added with `--tenant-id T` is found only with `--tenant-id T`; without the
+    /// flag only tenant-less datasets are reachable.
     #[arg(long = "tenant-id")]
     pub tenant_id: Option<String>,
 }
@@ -468,9 +471,10 @@ pub struct AddAndCognifyArgs {
     #[arg(long = "llm-max-parallel-requests", value_parser = clap::value_parser!(u32).range(1..))]
     pub llm_max_parallel_requests: Option<u32>,
 
-    /// Tenant to add and cognify as (applies to both the add and the dataset lookup). Datasets are matched by strict tenant equality: a
-    /// dataset added with `--tenant-id T` is found only with `--tenant-id T`;
-    /// without the flag only tenant-less datasets are reachable.
+    /// Tenant to add and cognify as (applies to both the add and the dataset
+    /// lookup). Datasets are matched by strict tenant equality: a dataset added
+    /// with `--tenant-id T` is found only with `--tenant-id T`; without the flag
+    /// only tenant-less datasets are reachable.
     #[arg(long = "tenant-id")]
     pub tenant_id: Option<String>,
 }
@@ -754,12 +758,21 @@ pub struct DeleteArgs {
     #[arg(long = "dataset-id", conflicts_with = "dataset_name")]
     pub dataset_id: Option<String>,
 
+    /// The acting user (default: the `default_user_id` setting). With a target
+    /// (`--all`, `--data-id`, `--dataset-name`/`--dataset-id`) it only names
+    /// who deletes; alone it selects that user's datasets in `--tenant-id`.
     #[arg(long = "user-id", short = 'u')]
     pub user_id: Option<String>,
 
+    /// Delete one data item. Name its dataset with `--dataset-name` or
+    /// `--dataset-id` (required under `--enforce-acl`); without one, the item
+    /// is detached from every dataset the acting user owns in `--tenant-id`.
     #[arg(long = "data-id")]
     pub data_id: Option<String>,
 
+    /// Delete the acting user's datasets in `--tenant-id` (Python
+    /// `datasets.delete_all`) — not a store-wide wipe. Under `--enforce-acl`:
+    /// every dataset the acting user may delete in the tenant.
     #[arg(long = "all", default_value_t = false)]
     pub all: bool,
 
@@ -779,15 +792,17 @@ pub struct DeleteArgs {
 
     /// Enforce ACL permission checks before deletion.
     ///
-    /// When enabled, the delete operation verifies that the requesting
-    /// principal (--user-id) holds "delete" permission on each target
-    /// dataset via the ACL table.
+    /// When enabled, the acting user (--user-id) must hold "delete"
+    /// permission, in --tenant-id, on each target dataset; a dataset of
+    /// another user is then reachable by --dataset-id. Not available in the
+    /// OSS build (no ACL backend); the cloud CLI provides it.
     #[arg(long = "enforce-acl", default_value_t = false)]
     pub enforce_acl: bool,
 
-    /// Tenant to delete in: names and the `--user-id`/`--all` scopes resolve only in this tenant. Datasets are matched by strict tenant equality: a
-    /// dataset added with `--tenant-id T` is found only with `--tenant-id T`;
-    /// without the flag only tenant-less datasets are reachable.
+    /// Tenant to delete in: names and the `--user-id`/`--all` scopes resolve only
+    /// in this tenant. Datasets are matched by strict tenant equality: a dataset
+    /// added with `--tenant-id T` is found only with `--tenant-id T`; without the
+    /// flag only tenant-less datasets are reachable.
     #[arg(long = "tenant-id")]
     pub tenant_id: Option<String>,
 }

@@ -18,11 +18,13 @@ use super::error::ApiError;
 /// `cognee.api.v1.forget.forget()`.
 #[derive(Debug, Clone)]
 pub enum DatasetRef {
-    /// Dataset identified by name (scoped to the `owner_id` passed to
-    /// [`forget`]).
+    /// Dataset identified by name — the `owner_id`'s dataset in the caller's
+    /// tenant (strict; see [`DatasetRef::resolve`]). Names never reach another
+    /// owner's or tenant's dataset.
     Name(String),
-    /// Dataset identified by UUID. Resolving a UUID back to a dataset name
-    /// requires an [`IngestDb`] connection.
+    /// Dataset identified by UUID. [`DatasetRef::resolve`] admits it only
+    /// when it is the owner's and in the caller's tenant; a by-id reach
+    /// through a grant is an `AuthorizedDeleteService` `DatasetById`.
     Id(Uuid),
 }
 
@@ -80,42 +82,6 @@ impl DatasetRef {
             }
         }
     }
-
-    /// Resolve this reference to a dataset name, performing a reverse lookup
-    /// via [`IngestDb::get_dataset`] when the reference is a UUID.
-    ///
-    /// # Errors
-    /// * Returns [`ApiError::InvalidArgument`] if `self` is [`DatasetRef::Id`]
-    ///   and `db` is `None` (we cannot resolve a UUID without a DB connection).
-    /// * Returns [`ApiError::InvalidArgument`] if the dataset cannot be found
-    ///   in the database, or if the dataset is owned by a different user.
-    pub async fn to_name(
-        &self,
-        owner_id: Uuid,
-        db: Option<&dyn IngestDb>,
-    ) -> Result<String, ApiError> {
-        match self {
-            DatasetRef::Name(name) => Ok(name.clone()),
-            DatasetRef::Id(id) => {
-                let db = db.ok_or_else(|| {
-                    ApiError::InvalidArgument(
-                        "db connection required to resolve dataset UUID".to_string(),
-                    )
-                })?;
-                let dataset = db.get_dataset(*id).await.map_err(|e| {
-                    ApiError::InvalidArgument(format!("Dataset {id} lookup failed: {e}"))
-                })?;
-                let dataset = dataset
-                    .ok_or_else(|| ApiError::InvalidArgument(format!("Dataset {id} not found")))?;
-                if dataset.owner_id != owner_id {
-                    return Err(ApiError::InvalidArgument(format!(
-                        "Dataset {id} not owned by the requesting user"
-                    )));
-                }
-                Ok(dataset.name)
-            }
-        }
-    }
 }
 
 /// What to forget.
@@ -125,7 +91,8 @@ pub enum ForgetTarget {
     Item { data_id: Uuid, dataset: DatasetRef },
     /// Delete an entire dataset (by name or UUID).
     Dataset { dataset: DatasetRef },
-    /// Delete all data for the given owner.
+    /// Delete the owner's datasets in the caller's tenant, one after another
+    /// by id, stopping at the first failure (Python `datasets.delete_all`).
     All,
     /// Wipe graph+vector for a dataset, keep files + Data/Dataset rows,
     /// reset cognify pipeline status only. Mirrors Python's
@@ -300,35 +267,6 @@ mod tests {
                 }
             }
             _ => panic!("expected Item variant"),
-        }
-    }
-
-    // ----- Unit tests for DatasetRef::to_name -----
-
-    #[tokio::test]
-    async fn dataset_ref_name_passthrough() {
-        // DatasetRef::Name with db=None should return the name without any DB
-        // lookup.
-        let owner_id = Uuid::new_v4();
-        let dref = DatasetRef::Name("my_ds".to_string());
-        let resolved = dref.to_name(owner_id, None).await.expect("passthrough ok");
-        assert_eq!(resolved, "my_ds");
-    }
-
-    #[tokio::test]
-    async fn dataset_ref_id_requires_db() {
-        // DatasetRef::Id with db=None must error with InvalidArgument.
-        let owner_id = Uuid::new_v4();
-        let dref = DatasetRef::Id(Uuid::new_v4());
-        let result = dref.to_name(owner_id, None).await;
-        match result {
-            Err(ApiError::InvalidArgument(msg)) => {
-                assert!(
-                    msg.contains("db connection required"),
-                    "unexpected msg: {msg}"
-                );
-            }
-            other => panic!("expected InvalidArgument, got {other:?}"),
         }
     }
 
