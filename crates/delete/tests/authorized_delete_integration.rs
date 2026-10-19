@@ -42,7 +42,23 @@ async fn seed_dataset_with_data(
     owner_id: Uuid,
     dataset_name: &str,
 ) -> (Uuid, Uuid) {
-    let dataset = Dataset::new(dataset_name.to_string(), owner_id, None, Uuid::new_v4());
+    seed_dataset_with_data_in(db, storage, owner_id, dataset_name, None).await
+}
+
+/// [`seed_dataset_with_data`] with the dataset row carrying `tenant_id`.
+async fn seed_dataset_with_data_in(
+    db: &DatabaseConnection,
+    storage: &MockStorage,
+    owner_id: Uuid,
+    dataset_name: &str,
+    tenant_id: Option<Uuid>,
+) -> (Uuid, Uuid) {
+    let dataset = Dataset::new(
+        dataset_name.to_string(),
+        owner_id,
+        tenant_id,
+        Uuid::new_v4(),
+    );
     let dataset_id = dataset.id;
     database::ops::datasets::create_dataset(db, dataset)
         .await
@@ -132,6 +148,7 @@ async fn acl_denied_returns_permission_denied() {
                 memory_only: false,
             },
             owner_id,
+            None,
         )
         .await;
 
@@ -188,6 +205,7 @@ async fn acl_granted_allows_deletion() {
                 memory_only: false,
             },
             owner_id,
+            None,
         )
         .await;
 
@@ -238,6 +256,7 @@ async fn preview_respects_acl() {
                 memory_only: false,
             },
             owner_id,
+            None,
         )
         .await;
 
@@ -285,6 +304,7 @@ async fn cross_user_isolation() {
                 memory_only: false,
             },
             owner_a,
+            None,
         )
         .await;
 
@@ -311,6 +331,7 @@ async fn cross_user_isolation() {
                 memory_only: false,
             },
             owner_b,
+            None,
         )
         .await;
 
@@ -345,4 +366,282 @@ async fn cross_user_isolation() {
         data_a.is_none(),
         "owner_a's data should be gone after successful delete"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Tenant scoping (W1/W2): a `delete` grant counts only on a dataset in the
+// caller's tenant, strict equality, `None` ⇔ NULL — Python
+// `get_all_user_permission_datasets.py:49-53@37f788bd2`, reached from
+// `get_authorized_dataset` (by id) and `delete_all` (`datasets.py:316-323`).
+//
+// Each fixture seeds the DB row with the tenant (the inner `DeleteService`
+// reads DB rows) **and** registers it with the mock (`MockAclDb` filters on
+// its own map) — otherwise the tests would pass vacuously.
+// ---------------------------------------------------------------------------
+
+/// Seed a dataset in `tenant` (DB row + mock registration). Returns
+/// `(dataset_id, data_id)`.
+async fn seed_in_tenant(
+    db: &DatabaseConnection,
+    storage: &MockStorage,
+    acl: &MockAclDb,
+    owner_id: Uuid,
+    name: &str,
+    tenant: Option<Uuid>,
+) -> (Uuid, Uuid) {
+    let ids = seed_dataset_with_data_in(db, storage, owner_id, name, tenant).await;
+    if let Some(t) = tenant {
+        acl.set_dataset_tenant(ids.0, t);
+    }
+    ids
+}
+
+fn request(scope: DeleteScope) -> DeleteRequest {
+    DeleteRequest {
+        scope,
+        mode: DeleteMode::Soft,
+        memory_only: false,
+    }
+}
+
+fn assert_denied<T: std::fmt::Debug>(result: Result<T, DeleteError>, what: &str) {
+    match result {
+        Err(DeleteError::PermissionDenied(_)) => {}
+        other => panic!("{what}: expected PermissionDenied, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn delete_grant_in_another_tenant_is_denied_like_no_grant_by_id() {
+    let (db, storage, acl) = setup().await;
+    let caller = Uuid::new_v4();
+    let t1 = Uuid::new_v4();
+    let t2 = Uuid::new_v4();
+    let (granted_ds, granted_data) =
+        seed_in_tenant(&db, &storage, &acl, caller, "t2_granted", Some(t2)).await;
+    let (ungranted_ds, ungranted_data) =
+        seed_in_tenant(&db, &storage, &acl, caller, "t2_ungranted", Some(t2)).await;
+    grant_delete_permission(&acl, caller, granted_ds).await;
+    let svc = build_authorized_service(&db, &storage, &acl);
+
+    for (ds, data, what) in [
+        (granted_ds, granted_data, "grant only in T2"),
+        (ungranted_ds, ungranted_data, "no grant"),
+    ] {
+        assert_denied(
+            svc.execute(
+                &request(DeleteScope::DatasetById { dataset_id: ds }),
+                caller,
+                Some(t1),
+            )
+            .await,
+            &format!("DatasetById, {what}"),
+        );
+        assert_denied(
+            svc.execute(
+                &request(DeleteScope::DataInDataset {
+                    dataset_id: ds,
+                    data_id: data,
+                    delete_dataset_if_empty: false,
+                }),
+                caller,
+                Some(t1),
+            )
+            .await,
+            &format!("DataInDataset, {what}"),
+        );
+        assert!(
+            database::ops::data::get_data(&db, data)
+                .await
+                .unwrap()
+                .is_some(),
+            "{what}: data must survive the denied delete"
+        );
+        assert!(
+            database::ops::datasets::get_dataset(&db, ds)
+                .await
+                .unwrap()
+                .is_some(),
+            "{what}: dataset must survive the denied delete"
+        );
+    }
+}
+
+#[tokio::test]
+async fn delete_grant_in_the_callers_tenant_is_admitted() {
+    let (db, storage, acl) = setup().await;
+    let caller = Uuid::new_v4();
+    let t2 = Uuid::new_v4();
+    let (ds_a, data_a) = seed_in_tenant(&db, &storage, &acl, caller, "t2_a", Some(t2)).await;
+    let (ds_b, _) = seed_in_tenant(&db, &storage, &acl, caller, "t2_b", Some(t2)).await;
+    grant_delete_permission(&acl, caller, ds_a).await;
+    grant_delete_permission(&acl, caller, ds_b).await;
+    let svc = build_authorized_service(&db, &storage, &acl);
+
+    svc.execute(
+        &request(DeleteScope::DataInDataset {
+            dataset_id: ds_a,
+            data_id: data_a,
+            delete_dataset_if_empty: false,
+        }),
+        caller,
+        Some(t2),
+    )
+    .await
+    .expect("DataInDataset in the caller's tenant is admitted");
+    svc.execute(
+        &request(DeleteScope::DatasetById { dataset_id: ds_b }),
+        caller,
+        Some(t2),
+    )
+    .await
+    .expect("DatasetById in the caller's tenant is admitted");
+    assert!(
+        database::ops::datasets::get_dataset(&db, ds_b)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn tenantless_caller_cannot_delete_a_tenanted_dataset_it_holds_delete_on() {
+    let (db, storage, acl) = setup().await;
+    let caller = Uuid::new_v4();
+    let t2 = Uuid::new_v4();
+    let (tenanted, _) = seed_in_tenant(&db, &storage, &acl, caller, "tenanted", Some(t2)).await;
+    let (untenanted, _) = seed_in_tenant(&db, &storage, &acl, caller, "untenanted", None).await;
+    grant_delete_permission(&acl, caller, tenanted).await;
+    grant_delete_permission(&acl, caller, untenanted).await;
+    let svc = build_authorized_service(&db, &storage, &acl);
+
+    assert_denied(
+        svc.execute(
+            &request(DeleteScope::DatasetById {
+                dataset_id: tenanted,
+            }),
+            caller,
+            None,
+        )
+        .await,
+        "tenant-less caller on a T2 dataset",
+    );
+    svc.execute(
+        &request(DeleteScope::DatasetById {
+            dataset_id: untenanted,
+        }),
+        caller,
+        None,
+    )
+    .await
+    .expect("tenant-less caller on a tenant-less dataset is admitted");
+}
+
+#[tokio::test]
+async fn user_scope_cover_excludes_grants_in_another_tenant() {
+    let (db, storage, acl) = setup().await;
+    let owner = Uuid::new_v4();
+    let t1 = Uuid::new_v4();
+    let t2 = Uuid::new_v4();
+    let (in_t1, data_t1) = seed_in_tenant(&db, &storage, &acl, owner, "in_t1", Some(t1)).await;
+    let (in_t2, _) = seed_in_tenant(&db, &storage, &acl, owner, "in_t2", Some(t2)).await;
+    grant_delete_permission(&acl, owner, in_t1).await;
+    grant_delete_permission(&acl, owner, in_t2).await;
+    let svc = build_authorized_service(&db, &storage, &acl);
+
+    assert_denied(
+        svc.execute(
+            &request(DeleteScope::User { owner_id: owner }),
+            owner,
+            Some(t1),
+        )
+        .await,
+        "User scope with an owner dataset in T2",
+    );
+    assert!(
+        database::ops::data::get_data(&db, data_t1)
+            .await
+            .unwrap()
+            .is_some(),
+        "nothing is deleted when the cover fails"
+    );
+
+    // Same fixture with every owner dataset in T1: the cover holds.
+    let (db, storage, acl) = setup().await;
+    let (a, _) = seed_in_tenant(&db, &storage, &acl, owner, "a", Some(t1)).await;
+    let (b, _) = seed_in_tenant(&db, &storage, &acl, owner, "b", Some(t1)).await;
+    grant_delete_permission(&acl, owner, a).await;
+    grant_delete_permission(&acl, owner, b).await;
+    let svc = build_authorized_service(&db, &storage, &acl);
+    svc.execute(
+        &request(DeleteScope::User { owner_id: owner }),
+        owner,
+        Some(t1),
+    )
+    .await
+    .expect("User scope with every owner dataset in the caller's tenant is admitted");
+}
+
+#[tokio::test]
+async fn all_scope_cover_excludes_grants_in_another_tenant() {
+    let (db, storage, acl) = setup().await;
+    let caller = Uuid::new_v4();
+    let t1 = Uuid::new_v4();
+    let t2 = Uuid::new_v4();
+    let (in_t1, data_t1) = seed_in_tenant(&db, &storage, &acl, caller, "in_t1", Some(t1)).await;
+    let (in_t2, _) = seed_in_tenant(&db, &storage, &acl, caller, "in_t2", Some(t2)).await;
+    grant_delete_permission(&acl, caller, in_t1).await;
+    grant_delete_permission(&acl, caller, in_t2).await;
+    let svc = build_authorized_service(&db, &storage, &acl);
+
+    assert_denied(
+        svc.execute(&request(DeleteScope::All), caller, Some(t1))
+            .await,
+        "All scope with a dataset in T2",
+    );
+    assert!(
+        database::ops::data::get_data(&db, data_t1)
+            .await
+            .unwrap()
+            .is_some(),
+        "nothing is deleted when the cover fails"
+    );
+
+    let (db, storage, acl) = setup().await;
+    let (a, _) = seed_in_tenant(&db, &storage, &acl, caller, "a", Some(t1)).await;
+    let (b, _) = seed_in_tenant(&db, &storage, &acl, caller, "b", Some(t1)).await;
+    grant_delete_permission(&acl, caller, a).await;
+    grant_delete_permission(&acl, caller, b).await;
+    let svc = build_authorized_service(&db, &storage, &acl);
+    svc.execute(&request(DeleteScope::All), caller, Some(t1))
+        .await
+        .expect("All scope with every dataset in the caller's tenant is admitted");
+}
+
+#[tokio::test]
+async fn preview_applies_the_tenant_too() {
+    let (db, storage, acl) = setup().await;
+    let caller = Uuid::new_v4();
+    let t1 = Uuid::new_v4();
+    let t2 = Uuid::new_v4();
+    let (ds, _) = seed_in_tenant(&db, &storage, &acl, caller, "t2_ds", Some(t2)).await;
+    grant_delete_permission(&acl, caller, ds).await;
+    let svc = build_authorized_service(&db, &storage, &acl);
+
+    assert_denied(
+        svc.preview(
+            &request(DeleteScope::DatasetById { dataset_id: ds }),
+            caller,
+            Some(t1),
+        )
+        .await,
+        "preview with a grant only in T2",
+    );
+    svc.preview(
+        &request(DeleteScope::DatasetById { dataset_id: ds }),
+        caller,
+        Some(t2),
+    )
+    .await
+    .expect("preview in the dataset's tenant is admitted");
 }

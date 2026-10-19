@@ -53,13 +53,13 @@ pub struct UpdateResult {
 /// * `llm` .. `cognify_config` - Components for the cognify phase.
 ///
 /// # Errors
-/// Returns `ApiError::InvalidArgument` when `acl_db` is set and the caller
-/// lacks `write` on the dataset — **not** `PermissionDenied`, which this
-/// doc previously claimed. The variant exists (`api::error::ApiError`) and is
-/// arguably the right one, but changing it is a caller-visible break, so the
-/// doc is corrected to the shipped behaviour and the shape is pinned by
-/// `missing_write_grant_is_denied`. Propagates errors from delete, add, or
-/// cognify phases.
+/// Returns `ApiError::PermissionDenied` when `acl_db` is set and the caller
+/// lacks `write` on the dataset **in `tenant_id`** — no grant and a grant only
+/// on another tenant's dataset answer the same, like Python's single
+/// `PermissionDeniedError` (403,
+/// `cognee/modules/users/exceptions/exceptions.py:42-51@37f788bd2`). A failing
+/// ACL backend is `ApiError::InvalidArgument`. Propagates errors from delete,
+/// add, or cognify phases.
 #[allow(clippy::too_many_arguments)]
 pub async fn update(
     data_id: Uuid,
@@ -85,7 +85,7 @@ pub async fn update(
 ) -> Result<UpdateResult, ApiError> {
     // ── Permission gate ───────────────────────────────────────────────────────
     if let Some(acl) = acl_db {
-        require_write_permission(acl, owner_id, dataset_id).await?;
+        require_write_permission(acl, owner_id, tenant_id, dataset_id).await?;
     }
 
     // ── Step 1: Delete old data ───────────────────────────────────────────────
@@ -178,26 +178,33 @@ pub async fn update(
     })
 }
 
-/// Deny the update unless `owner_id` holds `write` on `dataset_id`.
+/// Deny the update unless `owner_id` holds `write` on `dataset_id` in
+/// `tenant_id`.
 ///
-/// Uses the roles-aware check: Python authorizes `update()` through the
-/// dataset ACL (`ingest_data` → `get_specific_user_permission_datasets(user.id,
-/// "write", [dataset_id])`), which walks the caller's tenant and role grants
-/// as well as direct ones. A collaborator who holds `write` only via a role
-/// must therefore be admitted here too.
+/// Uses the roles-aware, tenant-filtered check: Python authorizes `update()`
+/// through the dataset ACL (`ingest_data` →
+/// `get_specific_user_permission_datasets(user.id, "write", [dataset_id])`,
+/// `cognee/modules/pipelines/layers/resolve_authorized_user_datasets.py:39`,
+/// `cognee/modules/users/permissions/methods/get_specific_user_permission_datasets.py:27-38`
+/// @37f788bd2), which walks the caller's tenant and role grants as well as
+/// direct ones and then keeps only datasets with `tenant_id == user.tenant_id`
+/// (`get_all_user_permission_datasets.py:49-53@37f788bd2`). A collaborator who
+/// holds `write` only via a role is admitted; a grant on another tenant's
+/// dataset is not.
 async fn require_write_permission(
     acl: &dyn AclDb,
     owner_id: Uuid,
+    tenant_id: Option<Uuid>,
     dataset_id: Uuid,
 ) -> Result<(), ApiError> {
     let permitted = acl
-        .has_permission_with_roles(owner_id, dataset_id, "write")
+        .has_permission_in_tenant(owner_id, dataset_id, "write", tenant_id)
         .await
         .map_err(|e| ApiError::InvalidArgument(e.to_string()))?;
     if permitted {
         Ok(())
     } else {
-        Err(ApiError::InvalidArgument(
+        Err(ApiError::PermissionDenied(
             "write permission denied on dataset".to_string(),
         ))
     }
@@ -224,7 +231,9 @@ mod tests {
         assert!(acl.grant_permission(role, dataset, "write").await.is_ok());
 
         assert!(
-            require_write_permission(&acl, user, dataset).await.is_ok(),
+            require_write_permission(&acl, user, None, dataset)
+                .await
+                .is_ok(),
             "a role-held write grant must satisfy the update gate"
         );
     }
@@ -238,12 +247,16 @@ mod tests {
         let dataset = Uuid::new_v4();
         assert!(acl.grant_permission(user, dataset, "write").await.is_ok());
 
-        assert!(require_write_permission(&acl, user, dataset).await.is_ok());
+        assert!(
+            require_write_permission(&acl, user, None, dataset)
+                .await
+                .is_ok()
+        );
     }
 
     /// Scenario: the caller holds `read` (directly and via a role) but not
-    /// `write`. Expected: denied with `InvalidArgument`, the pre-existing
-    /// error shape for this gate.
+    /// `write`. Expected: denied with `PermissionDenied` (Python's
+    /// `PermissionDeniedError`, 403).
     #[tokio::test]
     async fn missing_write_grant_is_denied() {
         let acl = MockAclDb::new();
@@ -257,10 +270,39 @@ mod tests {
         assert!(acl.grant_permission(user, dataset, "read").await.is_ok());
         assert!(acl.grant_permission(role, dataset, "read").await.is_ok());
 
-        let err = require_write_permission(&acl, user, dataset).await;
+        let err = require_write_permission(&acl, user, None, dataset).await;
         assert!(
-            matches!(err, Err(ApiError::InvalidArgument(_))),
+            matches!(err, Err(ApiError::PermissionDenied(_))),
             "got {err:?}"
+        );
+    }
+
+    /// Scenario: `write` granted on a dataset in tenant T2; the caller acts in
+    /// T1 (or tenant-less). Expected: the same `PermissionDenied` as no grant
+    /// — Python intersects with the tenant-filtered set
+    /// (`get_all_user_permission_datasets.py:49-53@37f788bd2`). In T2 the same
+    /// grant is admitted.
+    #[tokio::test]
+    async fn write_grant_in_another_tenant_is_denied() {
+        let acl = MockAclDb::new();
+        let user = Uuid::new_v4();
+        let t1 = Uuid::new_v4();
+        let t2 = Uuid::new_v4();
+        let dataset = Uuid::new_v4();
+        acl.set_dataset_tenant(dataset, t2);
+        assert!(acl.grant_permission(user, dataset, "write").await.is_ok());
+
+        for tenant in [Some(t1), None] {
+            let err = require_write_permission(&acl, user, tenant, dataset).await;
+            assert!(
+                matches!(err, Err(ApiError::PermissionDenied(_))),
+                "{tenant:?}: got {err:?}"
+            );
+        }
+        assert!(
+            require_write_permission(&acl, user, Some(t2), dataset)
+                .await
+                .is_ok()
         );
     }
 }

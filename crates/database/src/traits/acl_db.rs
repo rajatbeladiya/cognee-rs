@@ -56,21 +56,15 @@ pub trait AclDb: Send + Sync {
         principal_type: &str,
     ) -> Result<(), DatabaseError>;
 
-    /// Check permission considering role and tenant inheritance.
+    /// Return every dataset ID the user holds `permission_name` on via a
+    /// direct, tenant or role grant, across **every** tenant the user belongs
+    /// to. Deduplicated.
     ///
-    /// Resolution order (mirrors Python `get_all_user_permission_datasets`):
-    /// 1. Direct user ACL
-    /// 2. Tenant-level ACL for each tenant the user belongs to
-    /// 3. Role-level ACL for each role the user holds in those tenants
-    async fn has_permission_with_roles(
-        &self,
-        user_id: Uuid,
-        dataset_id: Uuid,
-        permission_name: &str,
-    ) -> Result<bool, DatabaseError>;
-
-    /// Return all dataset IDs the user can access via direct, tenant, or
-    /// role grants. Deduplicates results.
+    /// This is a building block, **not an authorization answer**: it applies
+    /// no `dataset.tenant_id` filter, so it can include another tenant's
+    /// datasets. Implementations use it to build
+    /// [`Self::authorized_dataset_ids_in_tenant`]; callers that authorize data
+    /// access must use that method or [`Self::has_permission_in_tenant`].
     async fn authorized_dataset_ids_with_roles(
         &self,
         user_id: Uuid,
@@ -84,8 +78,8 @@ pub trait AclDb: Send + Sync {
     /// This is the answer to "which datasets may this user read" in Python:
     /// `get_all_user_permission_datasets` unions the direct, tenant and role
     /// grants and then keeps only `dataset.tenant_id == user.tenant_id`
-    /// (`cognee/modules/users/permissions/methods/get_all_user_permission_datasets.py:49-55`
-    /// at f154b32). `authorized_dataset_ids_with_roles` deliberately spans every
+    /// (`cognee/modules/users/permissions/methods/get_all_user_permission_datasets.py:49-53`
+    /// @37f788bd2). `authorized_dataset_ids_with_roles` deliberately spans every
     /// tenant the user belongs to, so a caller that authorizes data access must
     /// use this variant (SDK-689).
     ///
@@ -98,4 +92,37 @@ pub trait AclDb: Send + Sync {
         permission_name: &str,
         tenant_id: Option<Uuid>,
     ) -> Result<Vec<Uuid>, DatabaseError>;
+
+    /// May `user_id` exercise `permission_name` on `dataset_id` *as a member
+    /// of `tenant_id`*? True iff `dataset_id` is in
+    /// [`Self::authorized_dataset_ids_in_tenant`]`(user_id, permission_name,
+    /// tenant_id)`: direct ∪ tenant ∪ role grants, then **strict**
+    /// `dataset.tenant_id == tenant_id` (`None` admits only datasets with no
+    /// tenant). An unknown dataset id is `false`.
+    ///
+    /// Python: `check_permission_on_dataset` / `get_authorized_dataset` →
+    /// `get_specific_user_permission_datasets(user, perm, [id])`, which
+    /// intersects the requested id with `get_all_user_permission_datasets` and
+    /// raises one `PermissionDeniedError` (403) when it is missing — no grant,
+    /// a grant only in another tenant, and an unknown id all answer the same.
+    /// (`cognee/modules/users/permissions/methods/check_permission_on_dataset.py:27`,
+    /// `get_specific_user_permission_datasets.py:27-38`,
+    /// `get_all_user_permission_datasets.py:49-53`,
+    /// `cognee/modules/users/exceptions/exceptions.py:42-51` @37f788bd2)
+    ///
+    /// The default is correct for every implementation because it is built on
+    /// the required, tenant-filtered listing; override it only for speed and
+    /// keep the same answer.
+    async fn has_permission_in_tenant(
+        &self,
+        user_id: Uuid,
+        dataset_id: Uuid,
+        permission_name: &str,
+        tenant_id: Option<Uuid>,
+    ) -> Result<bool, DatabaseError> {
+        Ok(self
+            .authorized_dataset_ids_in_tenant(user_id, permission_name, tenant_id)
+            .await?
+            .contains(&dataset_id))
+    }
 }

@@ -4,6 +4,14 @@
 //! `"delete"` permission on each target dataset before delegating to the
 //! inner [`DeleteService`]. The plain `DeleteService` remains available for
 //! edge/embedded deployments that do not require ACL enforcement.
+//!
+//! Every check is **tenant-scoped**: a grant counts only on a dataset whose
+//! `tenant_id` equals the caller's tenant (strict equality, `None` admits only
+//! tenant-less datasets), exactly like Python's
+//! `get_all_user_permission_datasets` filter
+//! (`cognee/modules/users/permissions/methods/get_all_user_permission_datasets.py:49-53@37f788bd2`).
+//! A grant only in another tenant is denied with the same
+//! [`DeleteError::PermissionDenied`] as no grant at all.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -16,8 +24,9 @@ use crate::{DeleteError, DeletePreview, DeleteRequest, DeleteResult, DeleteScope
 /// Authorization-enforcing delete service.
 ///
 /// Wraps a [`DeleteService`] and an [`AclDb`] implementation. Before every
-/// `execute()` or `preview()` call the wrapper verifies that `principal_id`
-/// holds `"delete"` permission on all affected datasets.
+/// `execute()` or `preview()` call the wrapper verifies that `principal_id`,
+/// acting in `tenant_id`, holds `"delete"` permission on all affected
+/// datasets (see the module docs for the tenant rule).
 pub struct AuthorizedDeleteService {
     inner: DeleteService,
     acl_db: Arc<dyn AclDb>,
@@ -42,8 +51,10 @@ impl AuthorizedDeleteService {
         &self,
         request: &DeleteRequest,
         principal_id: Uuid,
+        tenant_id: Option<Uuid>,
     ) -> Result<DeletePreview, DeleteError> {
-        self.check_authorization(request, principal_id).await?;
+        self.check_authorization(request, principal_id, tenant_id)
+            .await?;
         self.inner.preview(request).await
     }
 
@@ -52,17 +63,20 @@ impl AuthorizedDeleteService {
         &self,
         request: &DeleteRequest,
         principal_id: Uuid,
+        tenant_id: Option<Uuid>,
     ) -> Result<DeleteResult, DeleteError> {
-        self.check_authorization(request, principal_id).await?;
+        self.check_authorization(request, principal_id, tenant_id)
+            .await?;
         self.inner.execute(request).await
     }
 
     /// Verify that `principal_id` has "delete" permission on all datasets
-    /// that would be affected by the request.
+    /// that would be affected by the request, in `tenant_id`.
     async fn check_authorization(
         &self,
         request: &DeleteRequest,
         principal_id: Uuid,
+        tenant_id: Option<Uuid>,
     ) -> Result<(), DeleteError> {
         match &request.scope {
             DeleteScope::Data {
@@ -73,7 +87,7 @@ impl AuthorizedDeleteService {
             } => {
                 if let Some(ds_name) = dataset_name {
                     let dataset_id = self.resolve_dataset_id(*owner_id, ds_name).await?;
-                    self.require_delete_permission(principal_id, dataset_id)
+                    self.require_delete_permission(principal_id, tenant_id, dataset_id)
                         .await?;
                 } else {
                     // When no dataset_name is given, the inner service resolves
@@ -92,7 +106,8 @@ impl AuthorizedDeleteService {
 
                     for ds in &datasets {
                         if ds.owner_id == *owner_id {
-                            self.require_delete_permission(principal_id, ds.id).await?;
+                            self.require_delete_permission(principal_id, tenant_id, ds.id)
+                                .await?;
                         }
                     }
                 }
@@ -102,7 +117,7 @@ impl AuthorizedDeleteService {
                 dataset_name,
             } => {
                 let dataset_id = self.resolve_dataset_id(*owner_id, dataset_name).await?;
-                self.require_delete_permission(principal_id, dataset_id)
+                self.require_delete_permission(principal_id, tenant_id, dataset_id)
                     .await?;
             }
             // By id: Python's `get_authorized_dataset(user, dataset_id,
@@ -110,7 +125,7 @@ impl AuthorizedDeleteService {
             // (SDK-936).
             DeleteScope::DataInDataset { dataset_id, .. }
             | DeleteScope::DatasetById { dataset_id } => {
-                self.require_delete_permission(principal_id, *dataset_id)
+                self.require_delete_permission(principal_id, tenant_id, *dataset_id)
                     .await?;
             }
             DeleteScope::User { owner_id } => {
@@ -120,9 +135,16 @@ impl AuthorizedDeleteService {
                 // principal's authorized set covers them. Collected into a set:
                 // with tenant/role inheritance the authorized list can be
                 // tenant-wide, and the cover check below is per dataset.
+                //
+                // The set is tenant-filtered like Python's `delete_all`, which
+                // enumerates `get_authorized_existing_datasets([], "delete",
+                // user)` (`cognee/api/v1/datasets/datasets.py:316-323@37f788bd2`
+                // → `get_all_user_permission_datasets.py:49-53`). An owner
+                // dataset in another tenant is therefore not covered and the
+                // whole request fails closed.
                 let authorized: HashSet<Uuid> = self
                     .acl_db
-                    .authorized_dataset_ids_with_roles(principal_id, "delete")
+                    .authorized_dataset_ids_in_tenant(principal_id, "delete", tenant_id)
                     .await
                     .map_err(|e| DeleteError::Runtime(format!("ACL query failed: {e}")))?
                     .into_iter()
@@ -148,10 +170,13 @@ impl AuthorizedDeleteService {
             DeleteScope::All => {
                 // All-scope is an administrative operation. We check that
                 // the principal has delete permission on every dataset that
-                // exists. If any dataset lacks the permission, deny.
+                // exists. If any dataset lacks the permission, deny. Tenant-
+                // filtered like the User cover above (Python `datasets.py:
+                // 316-323@37f788bd2`): any dataset outside the caller's tenant
+                // fails the cover (fail closed).
                 let authorized: HashSet<Uuid> = self
                     .acl_db
-                    .authorized_dataset_ids_with_roles(principal_id, "delete")
+                    .authorized_dataset_ids_in_tenant(principal_id, "delete", tenant_id)
                     .await
                     .map_err(|e| DeleteError::Runtime(format!("ACL query failed: {e}")))?
                     .into_iter()
@@ -197,15 +222,22 @@ impl AuthorizedDeleteService {
         Ok(dataset.id)
     }
 
-    /// Check that the principal has "delete" permission on the dataset.
+    /// Check that the principal has "delete" permission on the dataset in
+    /// `tenant_id` — Python `get_authorized_dataset(user, id, "delete")` →
+    /// `get_specific_user_permission_datasets`
+    /// (`cognee/modules/data/methods/get_authorized_dataset.py:11-29`,
+    /// `cognee/modules/users/permissions/methods/get_specific_user_permission_datasets.py:27-38`
+    /// @37f788bd2). No grant and a grant only in another tenant answer the
+    /// same `PermissionDenied`.
     async fn require_delete_permission(
         &self,
         principal_id: Uuid,
+        tenant_id: Option<Uuid>,
         dataset_id: Uuid,
     ) -> Result<(), DeleteError> {
         let has_perm = self
             .acl_db
-            .has_permission_with_roles(principal_id, dataset_id, "delete")
+            .has_permission_in_tenant(principal_id, dataset_id, "delete", tenant_id)
             .await
             .map_err(|e| DeleteError::Runtime(format!("ACL check failed: {e}")))?;
 

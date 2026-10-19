@@ -91,7 +91,9 @@ const FALLBACK_VECTOR_COLLECTIONS: &[(&str, &str)] = &[
 /// authorize with `get_authorized_dataset(user, dataset_id, "delete")`, i.e. a
 /// `delete` grant, not ownership. `DeleteService` does **not** authorize them:
 /// the caller checks `delete` on `dataset_id` first, or uses
-/// [`AuthorizedDeleteService`], which does (SDK-936).
+/// [`AuthorizedDeleteService`], which does (SDK-936) — in the caller's tenant,
+/// so a grant only in another tenant is denied like no grant
+/// (`get_all_user_permission_datasets.py:49-53@37f788bd2`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum DeleteScope {
     Data {
@@ -3700,6 +3702,7 @@ mod tests {
                     memory_only: false,
                 },
                 owner,
+                None,
             )
             .await
             .expect("authorized delete should succeed");
@@ -3734,7 +3737,11 @@ mod tests {
             memory_only: false,
         };
         let err = svc
-            .execute(&by_id(DeleteScope::DatasetById { dataset_id }), mallory)
+            .execute(
+                &by_id(DeleteScope::DatasetById { dataset_id }),
+                mallory,
+                None,
+            )
             .await
             .expect_err("no grant, no delete");
         assert!(matches!(err, DeleteError::PermissionDenied(_)), "{err:?}");
@@ -3747,13 +3754,14 @@ mod tests {
                     delete_dataset_if_empty: false,
                 }),
                 bob,
+                None,
             )
             .await
             .expect("a delete grant must let a non-owner delete a data item");
         assert_eq!(result.deleted_dataset_links, 1);
 
         let result = svc
-            .execute(&by_id(DeleteScope::DatasetById { dataset_id }), bob)
+            .execute(&by_id(DeleteScope::DatasetById { dataset_id }), bob, None)
             .await
             .expect("a delete grant must let a non-owner delete the dataset");
         assert_eq!(result.deleted_datasets, 1);
@@ -3782,6 +3790,7 @@ mod tests {
                     memory_only: false,
                 },
                 owner,
+                None,
             )
             .await
             .expect_err("an item outside the dataset must be refused");
@@ -3811,6 +3820,7 @@ mod tests {
                     memory_only: false,
                 },
                 owner,
+                None,
             )
             .await
             .expect_err("should fail without delete permission");
@@ -3847,6 +3857,7 @@ mod tests {
                     memory_only: false,
                 },
                 owner_b, // wrong principal
+                None,
             )
             .await
             .expect_err("should fail for wrong principal");
@@ -3889,6 +3900,7 @@ mod tests {
                     memory_only: false,
                 },
                 user_b,
+                None,
             )
             .await
             .expect("delegated delete should succeed");
@@ -3947,7 +3959,8 @@ mod tests {
     // Python `check_permission_on_dataset` → `get_specific_user_permission_
     // datasets` → `get_all_user_permission_datasets` resolves direct, tenant
     // and role grants for every permission type. The delete path must use
-    // the `_with_roles` variants so a principal holding `delete` only through
+    // the roles-aware methods (`has_permission_in_tenant`,
+    // `authorized_dataset_ids_in_tenant`) so a principal holding `delete` only through
     // a role or tenant is admitted. Each test below grants to a role/tenant
     // id and calls as the member user; with the plain variants the grant is
     // invisible and every one of these goes red.
@@ -3955,7 +3968,7 @@ mod tests {
 
     /// Scenario: `delete` granted to a *role*; the caller holds the role.
     /// Exercises `require_delete_permission` (Dataset scope →
-    /// `has_permission_with_roles`).
+    /// `has_permission_in_tenant`).
     #[tokio::test]
     async fn authorized_delete_via_role_grant_dataset_scope() {
         use cognee_database::AclDb;
@@ -3989,6 +4002,7 @@ mod tests {
                     memory_only: false,
                 },
                 member,
+                None,
             )
             .await
             .expect("a role-held delete grant must authorize the delete");
@@ -4028,6 +4042,7 @@ mod tests {
                     memory_only: false,
                 },
                 member,
+                None,
             )
             .await
             .expect_err("a role-held read grant must not authorize delete");
@@ -4039,7 +4054,7 @@ mod tests {
 
     /// Scenario: User scope; the owner has two datasets, one granted to the
     /// caller directly and one granted only to a *tenant* the caller belongs
-    /// to. Exercises the `authorized_dataset_ids_with_roles` set-cover in the
+    /// to. Exercises the `authorized_dataset_ids_in_tenant` set-cover in the
     /// `DeleteScope::User` branch. A third, ungranted dataset must still deny.
     #[tokio::test]
     async fn authorized_delete_via_tenant_grant_user_scope() {
@@ -4068,7 +4083,7 @@ mod tests {
             memory_only: false,
         };
         let result = svc
-            .execute(&request, member)
+            .execute(&request, member, None)
             .await
             .expect("direct + tenant grants must cover every owner dataset");
         assert_eq!(result.deleted_datasets, 2);
@@ -4077,7 +4092,7 @@ mod tests {
         // check must fail even though the member still holds the others.
         seed_dataset_with_data(&db, &storage, owner, "user_ungranted").await;
         let err = svc
-            .execute(&request, member)
+            .execute(&request, member, None)
             .await
             .expect_err("an owner dataset with no grant must deny User scope");
         assert!(
@@ -4087,7 +4102,7 @@ mod tests {
     }
 
     /// Scenario: All scope; every dataset in the DB is granted to a *role*
-    /// the caller holds. Exercises `authorized_dataset_ids_with_roles` in the
+    /// the caller holds. Exercises `authorized_dataset_ids_in_tenant` in the
     /// `DeleteScope::All` branch.
     #[tokio::test]
     async fn authorized_delete_via_role_grant_all_scope() {
@@ -4129,6 +4144,7 @@ mod tests {
                     memory_only: false,
                 },
                 admin,
+                None,
             )
             .await
             .expect("role-held delete on every dataset must authorize All scope");
@@ -4182,6 +4198,7 @@ mod tests {
                     memory_only: false,
                 },
                 owner,
+                None,
             )
             .await
             .expect_err("preview should fail without permission");
