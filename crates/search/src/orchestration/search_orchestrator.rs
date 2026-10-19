@@ -577,18 +577,19 @@ impl SearchOrchestrator {
                     )
                 })?;
 
-                // One owner listing, filtered locally — Python's exact shape
+                // One tenant-strict point lookup per name: owner, name and
+                // `dataset.tenant_id == request.tenant_id` with `None` ⇔ NULL —
+                // Python's `get_dataset_ids` rule
                 // (`get_dataset_ids.py:30-34@37f788bd2`). Not
                 // `get_dataset_by_name(.., None)`: with `None` it applies no
                 // tenant predicate, and of two same-named rows it may return
                 // the tenanted one the strict readable set excludes.
-                let owned = resolver.list_datasets_by_owner(owner_id).await?;
                 let mut resolved = Vec::with_capacity(names.len());
                 let mut missing = Vec::new();
                 for name in names {
-                    match owned
-                        .iter()
-                        .find(|ds| ds.name == *name && ds.tenant_id == request.tenant_id)
+                    match resolver
+                        .get_dataset_by_name_in_tenant(name, owner_id, request.tenant_id)
+                        .await?
                     {
                         Some(ds) => resolved.push(ds.id),
                         None => missing.push(name.clone()),
@@ -617,9 +618,9 @@ impl SearchOrchestrator {
                 // Only when an `AclDb` is wired. Without one the check cannot
                 // reject anything: `readable_dataset_ids` falls back to
                 // `list_datasets_by_owner` filtered by strict tenant equality,
-                // and the name resolution above filtered that same listing on
-                // the same owner and strict tenant, so every resolved id is in
-                // the set by construction. Running it anyway would add a full
+                // and the name resolution above applied the same owner and
+                // strict tenant predicate (point lookups), so every resolved
+                // id is in the set by construction. Running it anyway would add a full
                 // owner-wide dataset listing to every name-scoped search for
                 // a result that is provably `Ok(())`.
                 if self.acl_db.is_some() {
