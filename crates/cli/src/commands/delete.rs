@@ -208,6 +208,38 @@ pub fn resolve_caller(
     Ok((owner_id, tenant_id))
 }
 
+/// The id of the caller's own dataset `dref` in `tenant_id` (strict). A
+/// dataset that does not exist, is another user's or is in another tenant gets
+/// one `Validation` answer (no existence oracle); a failed lookup is a
+/// `Runtime` error.
+async fn own_dataset_id(
+    dref: &DatasetRef,
+    owner_id: Uuid,
+    tenant_id: Option<Uuid>,
+    db: &dyn IngestDb,
+) -> Result<Uuid, CliError> {
+    let found = match dref {
+        DatasetRef::Id(id) => db
+            .get_dataset(*id)
+            .await
+            .map_err(|e| CliError::Runtime(format!("Failed to look up dataset {id}: {e}")))?
+            .filter(|ds| ds.owner_id == owner_id && ds.tenant_id == tenant_id),
+        DatasetRef::Name(name) => db
+            .get_dataset_by_name_in_tenant(name, owner_id, tenant_id)
+            .await
+            .map_err(|e| CliError::Runtime(format!("Failed to look up dataset '{name}': {e}")))?,
+    };
+    found.map(|ds| ds.id).ok_or_else(|| {
+        let what = match dref {
+            DatasetRef::Id(id) => id.to_string(),
+            DatasetRef::Name(name) => format!("'{name}'"),
+        };
+        CliError::Validation(format!(
+            "Dataset {what} was not found for this user in this tenant"
+        ))
+    })
+}
+
 /// Build the [`DeleteRequest`] for `args`, acting as `owner_id` in
 /// `tenant_id`.
 ///
@@ -256,12 +288,7 @@ pub async fn build_request_async(
     let scope = match authorization {
         RequestAuthorization::Ownership => {
             let dataset_id = match &dataset_ref {
-                Some(dref) => Some(
-                    dref.resolve(owner_id, tenant_id, Some(db.as_ref()))
-                        .await
-                        .map_err(|e| CliError::Validation(format!("{e}")))?
-                        .id,
-                ),
+                Some(dref) => Some(own_dataset_id(dref, owner_id, tenant_id, db.as_ref()).await?),
                 None => None,
             };
             match (data_id, dataset_id) {

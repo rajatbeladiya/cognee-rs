@@ -68,15 +68,10 @@ impl DatasetRef {
                         ApiError::InvalidArgument(format!("Dataset {id} lookup failed: {e}"))
                     })?
                     .ok_or_else(|| ApiError::InvalidArgument(format!("Dataset {id} not found")))?;
-                if dataset.owner_id != owner_id {
-                    return Err(ApiError::InvalidArgument(format!(
-                        "Dataset {id} not owned by the requesting user"
-                    )));
-                }
-                if dataset.tenant_id != tenant_id {
-                    return Err(ApiError::InvalidArgument(format!(
-                        "Dataset {id} not found in the caller's tenant"
-                    )));
+                // One answer for unknown, foreign and other-tenant ids: no
+                // existence oracle on other users' datasets.
+                if dataset.owner_id != owner_id || dataset.tenant_id != tenant_id {
+                    return Err(ApiError::InvalidArgument(format!("Dataset {id} not found")));
                 }
                 Ok(dataset)
             }
