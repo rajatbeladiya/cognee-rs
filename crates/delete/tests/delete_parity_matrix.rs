@@ -88,7 +88,7 @@ async fn seed_item(
         "file://item.txt",
         "txt",
         "text/plain",
-        &format!("hash-{data_id}"),
+        format!("hash-{data_id}"),
         owner,
     )
     .build();
