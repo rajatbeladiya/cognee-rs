@@ -11,13 +11,12 @@
 use std::sync::Arc;
 
 use cognee_database::{self as database, AclDb, DatabaseConnection, DeleteDb};
-use cognee_database::{DatabaseError, GraphEdge, GraphNode};
 use cognee_delete::{
     AuthorizedDeleteService, DeleteError, DeleteMode, DeleteRequest, DeleteScope, DeleteService,
 };
 use cognee_models::{Data, Dataset};
 use cognee_storage::{MockStorage, StorageTrait};
-use cognee_test_utils::MockAclDb;
+use cognee_test_utils::{FailingDeleteDb, MockAclDb};
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
@@ -923,179 +922,6 @@ async fn all_scope_preview_agrees_with_execute_on_shared_data() {
     assert_eq!(result.deleted_data, preview.data_to_delete);
 }
 
-/// A `DeleteDb` over SQLite whose `delete_dataset` fails for one id.
-struct FailingDeleteOf {
-    inner: Arc<DatabaseConnection>,
-    fail_delete_of: Option<Uuid>,
-}
-
-#[async_trait::async_trait]
-impl DeleteDb for FailingDeleteOf {
-    async fn get_data(&self, id: Uuid) -> Result<Option<Data>, DatabaseError> {
-        DeleteDb::get_data(self.inner.as_ref(), id).await
-    }
-
-    async fn delete_data(&self, id: Uuid) -> Result<(), DatabaseError> {
-        DeleteDb::delete_data(self.inner.as_ref(), id).await
-    }
-
-    async fn count_data_dataset_links(&self, data_id: Uuid) -> Result<usize, DatabaseError> {
-        DeleteDb::count_data_dataset_links(self.inner.as_ref(), data_id).await
-    }
-
-    async fn list_datasets_for_data(&self, data_id: Uuid) -> Result<Vec<Dataset>, DatabaseError> {
-        DeleteDb::list_datasets_for_data(self.inner.as_ref(), data_id).await
-    }
-
-    async fn get_dataset_data(&self, dataset_id: Uuid) -> Result<Vec<Data>, DatabaseError> {
-        DeleteDb::get_dataset_data(self.inner.as_ref(), dataset_id).await
-    }
-
-    async fn count_dataset_data(&self, dataset_id: Uuid) -> Result<usize, DatabaseError> {
-        DeleteDb::count_dataset_data(self.inner.as_ref(), dataset_id).await
-    }
-
-    async fn list_datasets_by_owner(&self, owner_id: Uuid) -> Result<Vec<Dataset>, DatabaseError> {
-        DeleteDb::list_datasets_by_owner(self.inner.as_ref(), owner_id).await
-    }
-
-    async fn list_datasets(&self) -> Result<Vec<Dataset>, DatabaseError> {
-        DeleteDb::list_datasets(self.inner.as_ref()).await
-    }
-
-    async fn delete_dataset(&self, id: Uuid) -> Result<(), DatabaseError> {
-        if Some(id) == self.fail_delete_of {
-            return Err(DatabaseError::QueryError(
-                "simulated delete_dataset failure".into(),
-            ));
-        }
-        DeleteDb::delete_dataset(self.inner.as_ref(), id).await
-    }
-
-    async fn detach_data_from_dataset(
-        &self,
-        dataset_id: Uuid,
-        data_id: Uuid,
-    ) -> Result<(), DatabaseError> {
-        DeleteDb::detach_data_from_dataset(self.inner.as_ref(), dataset_id, data_id).await
-    }
-
-    async fn delete_pipeline_runs_by_dataset(
-        &self,
-        dataset_id: Uuid,
-    ) -> Result<u64, DatabaseError> {
-        DeleteDb::delete_pipeline_runs_by_dataset(self.inner.as_ref(), dataset_id).await
-    }
-
-    async fn clear_pipeline_status_for_dataset(
-        &self,
-        dataset_id: Uuid,
-    ) -> Result<usize, DatabaseError> {
-        DeleteDb::clear_pipeline_status_for_dataset(self.inner.as_ref(), dataset_id).await
-    }
-
-    async fn clear_cognify_pipeline_status_for_data(
-        &self,
-        data_id: Uuid,
-        dataset_id: Uuid,
-    ) -> Result<(), DatabaseError> {
-        DeleteDb::clear_cognify_pipeline_status_for_data(self.inner.as_ref(), data_id, dataset_id)
-            .await
-    }
-
-    async fn get_nodes_by_dataset(
-        &self,
-        dataset_id: Uuid,
-    ) -> Result<Vec<GraphNode>, DatabaseError> {
-        DeleteDb::get_nodes_by_dataset(self.inner.as_ref(), dataset_id).await
-    }
-
-    async fn get_edges_by_dataset(
-        &self,
-        dataset_id: Uuid,
-    ) -> Result<Vec<GraphEdge>, DatabaseError> {
-        DeleteDb::get_edges_by_dataset(self.inner.as_ref(), dataset_id).await
-    }
-
-    async fn get_unique_nodes_for_data(
-        &self,
-        data_id: Uuid,
-        dataset_id: Uuid,
-    ) -> Result<Vec<GraphNode>, DatabaseError> {
-        DeleteDb::get_unique_nodes_for_data(self.inner.as_ref(), data_id, dataset_id).await
-    }
-
-    async fn get_unique_edges_for_data(
-        &self,
-        data_id: Uuid,
-        dataset_id: Uuid,
-    ) -> Result<Vec<GraphEdge>, DatabaseError> {
-        DeleteDb::get_unique_edges_for_data(self.inner.as_ref(), data_id, dataset_id).await
-    }
-
-    async fn delete_provenance_nodes_for_dataset(
-        &self,
-        dataset_id: Uuid,
-    ) -> Result<(), DatabaseError> {
-        DeleteDb::delete_provenance_nodes_for_dataset(self.inner.as_ref(), dataset_id).await
-    }
-
-    async fn delete_provenance_edges_for_dataset(
-        &self,
-        dataset_id: Uuid,
-    ) -> Result<(), DatabaseError> {
-        DeleteDb::delete_provenance_edges_for_dataset(self.inner.as_ref(), dataset_id).await
-    }
-
-    async fn delete_provenance_nodes_for_data(
-        &self,
-        data_id: Uuid,
-        dataset_id: Uuid,
-    ) -> Result<(), DatabaseError> {
-        DeleteDb::delete_provenance_nodes_for_data(self.inner.as_ref(), data_id, dataset_id).await
-    }
-
-    async fn delete_provenance_edges_for_data(
-        &self,
-        data_id: Uuid,
-        dataset_id: Uuid,
-    ) -> Result<(), DatabaseError> {
-        DeleteDb::delete_provenance_edges_for_data(self.inner.as_ref(), data_id, dataset_id).await
-    }
-
-    async fn get_provenance_node_count_for_data(
-        &self,
-        data_id: Uuid,
-        dataset_id: Uuid,
-    ) -> Result<usize, DatabaseError> {
-        DeleteDb::get_provenance_node_count_for_data(self.inner.as_ref(), data_id, dataset_id).await
-    }
-
-    async fn get_provenance_edge_count_for_data(
-        &self,
-        data_id: Uuid,
-        dataset_id: Uuid,
-    ) -> Result<usize, DatabaseError> {
-        DeleteDb::get_provenance_edge_count_for_data(self.inner.as_ref(), data_id, dataset_id).await
-    }
-
-    async fn delete_search_history_for_user(&self, user_id: Uuid) -> Result<u64, DatabaseError> {
-        DeleteDb::delete_search_history_for_user(self.inner.as_ref(), user_id).await
-    }
-
-    async fn delete_all_search_history(&self) -> Result<u64, DatabaseError> {
-        DeleteDb::delete_all_search_history(self.inner.as_ref()).await
-    }
-
-    async fn count_search_history_for_user(&self, user_id: Uuid) -> Result<u64, DatabaseError> {
-        DeleteDb::count_search_history_for_user(self.inner.as_ref(), user_id).await
-    }
-
-    async fn count_all_search_history(&self) -> Result<u64, DatabaseError> {
-        DeleteDb::count_all_search_history(self.inner.as_ref()).await
-    }
-}
-
 /// #3. `All` stops at the first failing dataset like Python's
 /// `delete_all` loop (`datasets.py:316-323@37f788bd2`), keeps what it already
 /// deleted, and reports it in `DeleteError::Partial`.
@@ -1123,10 +949,10 @@ async fn all_scope_reports_partial_progress_when_a_later_dataset_fails() {
     assert_eq!(order.len(), 3);
 
     let build = |fail: Uuid| {
-        let failing: Arc<dyn DeleteDb> = Arc::new(FailingDeleteOf {
-            inner: db.clone(),
-            fail_delete_of: Some(fail),
-        });
+        let failing: Arc<dyn DeleteDb> = Arc::new(FailingDeleteDb::new(
+            db.clone() as Arc<dyn DeleteDb>,
+            Some(fail),
+        ));
         AuthorizedDeleteService::new(
             DeleteService::new(storage.clone() as Arc<dyn StorageTrait>, failing.clone()),
             acl.clone() as Arc<dyn AclDb>,
