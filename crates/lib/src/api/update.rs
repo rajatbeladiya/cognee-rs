@@ -41,7 +41,8 @@ pub struct UpdateResult {
 /// * `data_id` - ID of the data item to replace.
 /// * `new_data` - Replacement data inputs.
 /// * `dataset_id` - Explicit dataset UUID (no re-derivation from name).
-/// * `dataset_name` - Dataset name (still required for delete scope).
+/// * `dataset_name` - Dataset name: only the add pipeline's name/lock key; both
+///   the delete and the add target `dataset_id`.
 /// * `owner_id` / `tenant_id` - Ownership context.
 /// * `node_set` - Optional graph node identifiers for access-control grouping.
 /// * `preferred_loaders` - Optional MIME-type-to-loader-name overrides.
@@ -89,18 +90,13 @@ pub async fn update(
     }
 
     // ── Step 1: Delete old data ───────────────────────────────────────────────
-    let delete_request = DeleteRequest {
-        scope: DeleteScope::Data {
-            owner_id,
-            data_id,
-            dataset_name: Some(dataset_name.to_string()),
-            delete_dataset_if_empty: false,
-        },
-        // Python update() → datasets.delete_data defaults mode="soft" (datasets.py:147).
-        mode: DeleteMode::Soft,
-        memory_only: false,
-    };
-    let delete_result = delete_service.execute(&delete_request).await?;
+    // By the authorized `dataset_id`, not by name: a by-name scope is
+    // re-resolved without a tenant predicate and could detach the item from a
+    // same-named dataset in another tenant — not the one the write check just
+    // authorized. Python's `update()` is driven by `dataset_id` throughout
+    // (`cognee/api/v1/update/update.py:36@37f788bd2`); step 2 already adds by
+    // id (`AddParams::dataset_id`).
+    let delete_result = delete_old_data(delete_service, dataset_id, data_id).await?;
 
     // ── Step 2: Re-add new data ───────────────────────────────────────────────
     let params = AddParams {
@@ -176,6 +172,26 @@ pub async fn update(
         new_data: data_items,
         cognify_result,
     })
+}
+
+/// Step 1 of [`update`]: detach/delete `data_id` from the dataset
+/// `dataset_id` — by id (see the comment at the call site).
+async fn delete_old_data(
+    delete_service: &DeleteService,
+    dataset_id: Uuid,
+    data_id: Uuid,
+) -> Result<DeleteResult, ApiError> {
+    let delete_request = DeleteRequest {
+        scope: DeleteScope::DataInDataset {
+            dataset_id,
+            data_id,
+            delete_dataset_if_empty: false,
+        },
+        // Python update() → datasets.delete_data defaults mode="soft" (datasets.py:147).
+        mode: DeleteMode::Soft,
+        memory_only: false,
+    };
+    Ok(delete_service.execute(&delete_request).await?)
 }
 
 /// Deny the update unless `owner_id` holds `write` on `dataset_id` in
@@ -303,6 +319,69 @@ mod tests {
             require_write_permission(&acl, user, Some(t2), dataset)
                 .await
                 .is_ok()
+        );
+    }
+
+    /// Review loop 2 #1. One data item is attached to `"x"` in T1 (seeded
+    /// first) and to the tenant-less `"x"`. Updating it in the tenant-less
+    /// dataset must detach it there only. The old by-name delete step
+    /// re-resolved `"x"` with no tenant predicate and could hit the T1 row.
+    #[tokio::test]
+    async fn delete_step_targets_the_authorized_dataset_id_not_a_same_named_row() {
+        use cognee_database::{DeleteDb, IngestDb, connect, initialize};
+        use cognee_models::Dataset;
+        let db = Arc::new(connect("sqlite::memory:").await.unwrap());
+        initialize(&db).await.unwrap();
+        let owner = Uuid::new_v4();
+        let t1 = Uuid::new_v4();
+        let ingest: &dyn IngestDb = db.as_ref();
+        let tenanted = ingest
+            .create_dataset(Dataset::new("x".into(), owner, Some(t1), Uuid::new_v4()))
+            .await
+            .unwrap();
+        let untenanted = ingest
+            .create_dataset(Dataset::new("x".into(), owner, None, Uuid::new_v4()))
+            .await
+            .unwrap();
+        let loc = format!("file:///tmp/{}.txt", Uuid::new_v4());
+        let data = Data::builder(
+            Uuid::new_v4(),
+            "d.txt",
+            loc.as_str(),
+            loc.as_str(),
+            "txt",
+            "text/plain",
+            "hash",
+            owner,
+        )
+        .build();
+        ingest.create_data(data.clone()).await.unwrap();
+        for ds in [tenanted.id, untenanted.id] {
+            ingest.attach_data_to_dataset(ds, data.id).await.unwrap();
+        }
+        let delete_service = DeleteService::new(
+            Arc::new(cognee_storage::MockStorage::new()) as Arc<dyn StorageTrait>,
+            db.clone() as Arc<dyn DeleteDb>,
+        );
+
+        delete_old_data(&delete_service, untenanted.id, data.id)
+            .await
+            .unwrap();
+
+        let ids = |v: Vec<Data>| v.into_iter().map(|d| d.id).collect::<Vec<_>>();
+        assert!(
+            ids(DeleteDb::get_dataset_data(db.as_ref(), untenanted.id)
+                .await
+                .unwrap())
+            .is_empty(),
+            "detached from the authorized (tenant-less) dataset"
+        );
+        assert_eq!(
+            ids(DeleteDb::get_dataset_data(db.as_ref(), tenanted.id)
+                .await
+                .unwrap()),
+            vec![data.id],
+            "the same-named T1 dataset keeps its link"
         );
     }
 }

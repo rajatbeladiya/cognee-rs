@@ -6,9 +6,13 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use cognee_database::ops::acl::grant_all_permissions_on_dataset_via_trait;
-use cognee_database::{AclDb, IngestDb, PipelineRunStatus};
-use cognee_delete::{DeleteMode, DeleteRequest, DeleteResult, DeleteScope, DeleteService};
+use cognee_database::ops::acl::{
+    authorized_datasets_in_tenant, grant_all_permissions_on_dataset_via_trait,
+};
+use cognee_database::{AclDb, DeleteDb, IngestDb, PipelineRunStatus};
+use cognee_delete::{
+    DeleteError, DeleteMode, DeleteRequest, DeleteResult, DeleteScope, DeleteService,
+};
 use cognee_ingestion::generate_dataset_id;
 use cognee_models::{Data, Dataset};
 use uuid::Uuid;
@@ -36,9 +40,12 @@ pub use cognee_database::DatasetDb;
 /// (`cognee/modules/users/permissions/methods/get_all_user_permission_datasets.py:49-53@37f788bd2`):
 /// - [`Self::list_datasets`] and [`Self::delete_all`] apply it on **both**
 ///   paths (ACL and ownership fallback);
-/// - the per-id methods ([`Self::list_data`], [`Self::has_data`],
-///   [`Self::empty_dataset`], [`Self::delete_data`]) apply it **only under an
-///   ACL**. Without an ACL they perform no ownership or tenant check at all
+/// - [`Self::empty_dataset`] and [`Self::delete_data`] apply it on both
+///   paths: under an ACL through the `delete` check, without one through the
+///   ownership fallback (the dataset must be the caller's and in its tenant);
+///   either way the delete then runs **by id**, never re-resolved by name;
+/// - [`Self::list_data`] and [`Self::has_data`] apply it **only under an
+///   ACL**. Without an ACL they perform no ownership or tenant check
 ///   (`tenant_id` is ignored) — a known gap left to S2/S3.
 ///
 /// Under an ACL, "no grant", "a grant only in another tenant" and "unknown
@@ -92,16 +99,11 @@ impl DatasetManager {
         tenant_id: Option<Uuid>,
     ) -> Result<Vec<Dataset>, DatasetError> {
         if let Some(acl) = &self.acl_db {
-            let authorized_ids = acl
-                .authorized_dataset_ids_in_tenant(owner_id, "read", tenant_id)
-                .await?;
-            let mut datasets = Vec::with_capacity(authorized_ids.len());
-            for id in authorized_ids {
-                if let Some(ds) = self.db.get_dataset(id).await? {
-                    datasets.push(ds);
-                }
-            }
-            Ok(datasets)
+            let db: &dyn DeleteDb = self.db.as_ref();
+            Ok(
+                authorized_datasets_in_tenant(acl.as_ref(), db, owner_id, "read", tenant_id)
+                    .await?,
+            )
         } else {
             // Ownership fallback, strict like Python (`get_dataset_ids.py:34`,
             // `get_all_user_permission_datasets.py:49-53` @37f788bd2).
@@ -202,7 +204,7 @@ impl DatasetManager {
 
     /// Delete all data in a dataset (and the dataset record itself).
     ///
-    /// Delegates to `DeleteService` with `DeleteScope::Dataset`.
+    /// Delegates to `DeleteService` with `DeleteScope::DatasetById`.
     ///
     /// Under an ACL, `delete` in `tenant_id` is checked **before** the dataset
     /// is looked up, so an unknown id is `PermissionDenied`, not `NotFound`
@@ -216,22 +218,13 @@ impl DatasetManager {
     ) -> Result<DeleteResult, DatasetError> {
         // With an ACL the `delete` grant is the authorization, so the dataset
         // is deleted by id whoever owns it (Python `empty_dataset`,
-        // `datasets.py:184-215@37f788bd2`; SDK-936). Without one, ownership is
-        // the authorization: the owner-scoped form.
-        let scope = if self.acl_db.is_some() {
-            self.check_delete_permission(owner_id, tenant_id, dataset_id)
-                .await?;
-            self.require_dataset(dataset_id).await?;
-            DeleteScope::DatasetById { dataset_id }
-        } else {
-            let dataset = self.require_dataset(dataset_id).await?;
-            DeleteScope::Dataset {
-                owner_id,
-                dataset_name: dataset.name,
-            }
-        };
+        // `datasets.py:184-215@37f788bd2`; SDK-936). Without one, ownership in
+        // the caller's tenant is the authorization. Either way the delete is
+        // by id: re-resolving the name would not be tenant-scoped.
+        self.authorize_delete(owner_id, tenant_id, dataset_id)
+            .await?;
         let request = DeleteRequest {
-            scope,
+            scope: DeleteScope::DatasetById { dataset_id },
             mode: DeleteMode::Hard,
             memory_only: false,
         };
@@ -240,7 +233,7 @@ impl DatasetManager {
 
     /// Delete a specific data item from a dataset.
     ///
-    /// Delegates to `DeleteService` with `DeleteScope::Data`.
+    /// Delegates to `DeleteService` with `DeleteScope::DataInDataset`.
     ///
     /// Under an ACL, `delete` in `tenant_id` is checked **before** the dataset
     /// is looked up (Python `delete_data`, `datasets.py:234-240@37f788bd2`,
@@ -259,28 +252,16 @@ impl DatasetManager {
         delete_dataset_if_empty: bool,
         delete_service: &DeleteService,
     ) -> Result<DeleteResult, DatasetError> {
-        // As in `empty_dataset`: by id under an ACL (Python `delete_data`,
-        // `datasets.py:218-313@37f788bd2`), owner-scoped without one.
-        let scope = if self.acl_db.is_some() {
-            self.check_delete_permission(owner_id, tenant_id, dataset_id)
-                .await?;
-            self.require_dataset(dataset_id).await?;
-            DeleteScope::DataInDataset {
+        // As in `empty_dataset` (Python `delete_data`,
+        // `datasets.py:218-313@37f788bd2`): authorize, then delete by id.
+        self.authorize_delete(owner_id, tenant_id, dataset_id)
+            .await?;
+        let request = DeleteRequest {
+            scope: DeleteScope::DataInDataset {
                 dataset_id,
                 data_id,
                 delete_dataset_if_empty,
-            }
-        } else {
-            let dataset = self.require_dataset(dataset_id).await?;
-            DeleteScope::Data {
-                owner_id,
-                data_id,
-                dataset_name: Some(dataset.name),
-                delete_dataset_if_empty,
-            }
-        };
-        let request = DeleteRequest {
-            scope,
+            },
             mode,
             memory_only: false,
         };
@@ -309,27 +290,36 @@ impl DatasetManager {
         delete_service: &DeleteService,
     ) -> Result<Vec<DeleteResult>, DatasetError> {
         let datasets = if let Some(acl) = &self.acl_db {
-            let ids = acl
-                .authorized_dataset_ids_in_tenant(owner_id, "delete", tenant_id)
-                .await?;
-            let mut datasets = Vec::with_capacity(ids.len());
-            for id in ids {
-                if let Some(ds) = self.db.get_dataset(id).await? {
-                    datasets.push(ds);
-                }
-            }
-            datasets
+            let db: &dyn DeleteDb = self.db.as_ref();
+            authorized_datasets_in_tenant(acl.as_ref(), db, owner_id, "delete", tenant_id).await?
         } else {
             self.list_datasets(owner_id, tenant_id).await?
         };
-        let mut results = Vec::with_capacity(datasets.len());
+        // One dataset after another, stopping at the first failure like
+        // Python's loop; the datasets already deleted are reported in
+        // `DeleteError::Partial` (a failure on the first is returned as is).
+        let mut results: Vec<DeleteResult> = Vec::with_capacity(datasets.len());
         for ds in datasets {
             let request = DeleteRequest {
                 scope: DeleteScope::DatasetById { dataset_id: ds.id },
                 mode: DeleteMode::Hard,
                 memory_only: false,
             };
-            results.push(delete_service.execute(&request).await?);
+            match delete_service.execute(&request).await {
+                Ok(r) => results.push(r),
+                Err(e) if results.is_empty() => return Err(e.into()),
+                Err(e) => {
+                    let mut completed = DeleteResult::default();
+                    for r in results {
+                        completed += r;
+                    }
+                    return Err(DatasetError::Delete(DeleteError::Partial {
+                        completed: Box::new(completed),
+                        failed_dataset_id: ds.id,
+                        source: Box::new(e),
+                    }));
+                }
+            }
         }
         Ok(results)
     }
@@ -429,6 +419,35 @@ impl DatasetManager {
                 .await?
         {
             return Err(DatasetError::PermissionDenied);
+        }
+        Ok(())
+    }
+
+    /// Authorize a delete of `dataset_id` by the caller.
+    ///
+    /// - **ACL**: `delete` in `tenant_id` (checked before any lookup, so an
+    ///   unknown id is `PermissionDenied`), then the row must exist.
+    /// - **No ACL** (ownership fallback): the row must exist, be owned by
+    ///   `owner_id` and be in `tenant_id` (strict, `None` ⇔ NULL — Python
+    ///   `get_dataset_ids.py:34@37f788bd2`); otherwise the same
+    ///   `DeleteError::Validation("… not found …")` a by-name miss gave before.
+    async fn authorize_delete(
+        &self,
+        owner_id: Uuid,
+        tenant_id: Option<Uuid>,
+        dataset_id: Uuid,
+    ) -> Result<(), DatasetError> {
+        if self.acl_db.is_some() {
+            self.check_delete_permission(owner_id, tenant_id, dataset_id)
+                .await?;
+            self.require_dataset(dataset_id).await?;
+            return Ok(());
+        }
+        let dataset = self.require_dataset(dataset_id).await?;
+        if dataset.owner_id != owner_id || dataset.tenant_id != tenant_id {
+            return Err(DatasetError::Delete(DeleteError::Validation(format!(
+                "Dataset {dataset_id} was not found for owner {owner_id}"
+            ))));
         }
         Ok(())
     }
@@ -1453,5 +1472,72 @@ mod tests {
             ingest.get_dataset(other_tenant.id).await.unwrap().is_some(),
             "a delete grant in T2 must not be used from T1"
         );
+    }
+
+    /// Review loop 2. Without an ACL, `empty_dataset` / `delete_data` delete
+    /// **by id** after an ownership + strict-tenant check. Fixture: `"x"` in
+    /// T1 (seeded first) and a tenant-less `"x"`, same owner. The old by-name
+    /// re-resolution could hit the T1 row.
+    #[tokio::test]
+    async fn no_acl_deletes_go_by_id_and_require_owner_and_tenant() {
+        use cognee_database::DeleteDb;
+        let db = fresh_db().await;
+        let acl = cognee_test_utils::MockAclDb::new();
+        let owner = Uuid::new_v4();
+        let t1 = Uuid::new_v4();
+        let mgr = DatasetManager::new(db.clone() as Arc<dyn DatasetDb>);
+        let tenanted = mgr.create_dataset("x", owner, Some(t1)).await.unwrap();
+        let untenanted = mgr.create_dataset("x", owner, None).await.unwrap();
+        let (other, other_data) = seed_tenant_dataset(&db, &acl, owner, None).await;
+        let delete_service = DeleteService::new(
+            Arc::new(cognee_storage::MockStorage::new()) as Arc<dyn cognee_storage::StorageTrait>,
+            db.clone() as Arc<dyn DeleteDb>,
+        );
+        let ingest: &dyn IngestDb = db.as_ref();
+
+        // A T1 dataset is not the tenant-less caller's to delete.
+        for err in [
+            mgr.empty_dataset(tenanted.id, owner, None, &delete_service)
+                .await
+                .expect_err("tenant mismatch"),
+            mgr.empty_dataset(untenanted.id, Uuid::new_v4(), None, &delete_service)
+                .await
+                .expect_err("owner mismatch"),
+        ] {
+            assert!(
+                matches!(err, DatasetError::Delete(DeleteError::Validation(_))),
+                "{err:?}"
+            );
+        }
+
+        mgr.empty_dataset(untenanted.id, owner, None, &delete_service)
+            .await
+            .unwrap();
+        assert!(ingest.get_dataset(untenanted.id).await.unwrap().is_none());
+        assert!(
+            ingest.get_dataset(tenanted.id).await.unwrap().is_some(),
+            "the same-named T1 dataset survives"
+        );
+
+        mgr.delete_data(
+            other.id,
+            other_data,
+            owner,
+            None,
+            DeleteMode::Soft,
+            false,
+            &delete_service,
+        )
+        .await
+        .unwrap();
+        assert!(
+            DeleteDb::get_dataset_data(db.as_ref(), other.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        mgr.empty_dataset(tenanted.id, owner, Some(t1), &delete_service)
+            .await
+            .expect("the T1 owner in T1 may delete it");
     }
 }
