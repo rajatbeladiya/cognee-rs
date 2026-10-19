@@ -16,8 +16,9 @@
 //! The owner-scoped scopes (`Data`, `Dataset`, `User`) carry the tenant they
 //! resolve in; it must be the caller's tenant, otherwise the request is denied
 //! (it could never be authorized). Grant reach goes only through the by-id
-//! scopes (`DataInDataset`, `DatasetById`): names stay the owner's, as in
-//! Python (`cognee/modules/data/methods/get_unique_dataset_id.py:15-24@37f788bd2`).
+//! scopes (`DataInDataset`, `DatasetById`): a by-name scope must name the
+//! **caller's** own dataset (`owner_id == principal`, else denied before any
+//! lookup), as in Python (`cognee/modules/data/methods/get_unique_dataset_id.py:15-24@37f788bd2`).
 //! A data item without its dataset (`Data { dataset_name: None }`) is refused:
 //! Python has no dataset-less item delete
 //! (`cognee/api/v1/datasets/datasets.py:218-224@37f788bd2`,
@@ -96,10 +97,7 @@ impl AuthorizedDeleteService {
                 let ids = self
                     .covered_user_datasets(principal_id, tenant_id, *owner_id, *scope_tenant)
                     .await?;
-                return self
-                    .inner
-                    .preview_user_datasets(*owner_id, &ids, principal_id == *owner_id)
-                    .await;
+                return self.inner.preview_datasets_by_id(&ids).await;
             }
             _ => {}
         }
@@ -138,9 +136,9 @@ impl AuthorizedDeleteService {
     /// [`DeleteScope::User`] must target the caller's tenant; the owner's
     /// datasets in it must all be covered by the caller's `delete` grants in
     /// that tenant (else the generic `PermissionDenied`), and are then deleted
-    /// by id with the same stop-at-first-error rule. The owner's search
-    /// history is deleted only when the caller **is** the owner: no grant
-    /// reaches another user's history.
+    /// by id with the same stop-at-first-error rule. Search history is never
+    /// deleted, as in Python's `delete_all` (the history table has no tenant,
+    /// so clearing it would reach the owner's other tenants).
     pub async fn execute(
         &self,
         request: &DeleteRequest,
@@ -169,7 +167,7 @@ impl AuthorizedDeleteService {
                     .await?;
                 return self
                     .inner
-                    .execute_user_datasets(*owner_id, &ids, request, principal_id == *owner_id)
+                    .execute_datasets_by_id(&ids, request.mode.clone(), request.memory_only)
                     .await;
             }
             _ => {}
@@ -216,6 +214,30 @@ impl AuthorizedDeleteService {
             return Err(DeleteError::PermissionDenied(SCOPE_DENIED.to_string()));
         }
         Ok(())
+    }
+
+    /// Deny a by-name scope (`Dataset`, `Data { dataset_name: Some }`) that
+    /// is not the caller's own name in the caller's tenant, **before** any
+    /// lookup. Python resolves a name only among the caller's own datasets
+    /// (`cognee/modules/data/methods/get_dataset_ids.py:29-34@37f788bd2`, with
+    /// `user.id`); grant reach goes only through ids
+    /// (`get_unique_dataset_id.py:15-24@37f788bd2`). Checking first also keeps
+    /// another owner's dataset names from answering "not found" vs "denied".
+    fn require_own_name_scope(
+        principal_id: Uuid,
+        tenant_id: Option<Uuid>,
+        owner_id: Uuid,
+        scope_tenant: Option<Uuid>,
+    ) -> Result<(), DeleteError> {
+        if owner_id != principal_id {
+            tracing::warn!(
+                principal = %principal_id,
+                scope_owner = %owner_id,
+                "delete denied: a by-name scope must name the caller's own dataset"
+            );
+            return Err(DeleteError::PermissionDenied(SCOPE_DENIED.to_string()));
+        }
+        Self::require_caller_tenant(principal_id, tenant_id, scope_tenant)
     }
 
     /// The `User { owner_id, scope_tenant }` target set, checked: the scope
@@ -283,7 +305,7 @@ impl AuthorizedDeleteService {
                 delete_dataset_if_empty,
                 tenant_id: scope_tenant,
             } => {
-                Self::require_caller_tenant(principal_id, tenant_id, *scope_tenant)?;
+                Self::require_own_name_scope(principal_id, tenant_id, *owner_id, *scope_tenant)?;
                 let dataset_id = self
                     .resolve_dataset_id(*owner_id, ds_name, tenant_id)
                     .await?;
@@ -300,7 +322,7 @@ impl AuthorizedDeleteService {
                 dataset_name,
                 tenant_id: scope_tenant,
             } => {
-                Self::require_caller_tenant(principal_id, tenant_id, *scope_tenant)?;
+                Self::require_own_name_scope(principal_id, tenant_id, *owner_id, *scope_tenant)?;
                 let dataset_id = self
                     .resolve_dataset_id(*owner_id, dataset_name, tenant_id)
                     .await?;

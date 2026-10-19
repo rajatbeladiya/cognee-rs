@@ -3,7 +3,7 @@
     clippy::expect_used,
     reason = "test code — panics are acceptable failures"
 )]
-//! S2 delete-parity matrix (SDK-936), `cognee-delete` half: every delete
+//! Delete-parity matrix (SDK-936), `cognee-delete` half: every delete
 //! entry point × {grant (G), no grant (N), grant only in another tenant (X),
 //! no ACL (A)}. "ACL" is [`AuthorizedDeleteService`], "no ACL" the plain
 //! [`DeleteService`].
@@ -17,7 +17,7 @@
 //!   (`datasets.py:218-224`, `forget.py:161-162`) and is refused under an ACL;
 //! - delete-all / `User` are tenant-scoped, by id, and stop at the first error
 //!   (`datasets.py:316-323`, `forget.py:191-205`);
-//! - W5: a missing item inside an empty dataset deletes the dataset when
+//! - a missing item inside an empty dataset deletes the dataset when
 //!   `delete_dataset_if_empty` is set (`datasets.py:259-273`).
 //!
 //! Fixture: owner O has three datasets all named `"shared"`, seeded `o_t2`
@@ -264,7 +264,7 @@ fn data_in(dataset: Uuid, data: Uuid) -> DeleteScope {
 }
 
 // ---------------------------------------------------------------------------
-// E1 by-id dataset (`DatasetById`)
+// by-id dataset (`DatasetById`)
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -309,7 +309,7 @@ async fn by_id_dataset_other_tenant_grant_denied() {
 }
 
 // ---------------------------------------------------------------------------
-// E2 by-name dataset (`Dataset{name, tenant}`)
+// by-name dataset (`Dataset{name, tenant}`)
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -357,6 +357,53 @@ async fn by_name_dataset_without_grant_denied() {
         "N: outsider",
     );
     f.assert_untouched("N").await;
+}
+
+/// Names never reach grants: a by-name scope must name the **caller's** own
+/// dataset. G holds `delete` on `o_t1`, yet `Dataset{owner: O, "shared", T1}`
+/// sent by G is denied — and so is a name O does not have, with the same
+/// error, so the scope is no oracle on O's dataset names
+/// (`get_dataset_ids.py:29-34`, `get_unique_dataset_id.py:15-24` @37f788bd2).
+#[tokio::test]
+async fn by_name_scope_of_another_owner_denied_even_with_grant() {
+    let f = fixture().await;
+    let missing = DeleteScope::Dataset {
+        owner_id: f.owner,
+        dataset_name: "no_such_name".to_string(),
+        tenant_id: Some(f.t1),
+    };
+    for (scope, what) in [
+        (dataset_by_name(f.owner, Some(f.t1)), "Dataset by O's name"),
+        (
+            data_by_name(f.owner, f.o_t1.1, Some(f.t1)),
+            "Data by O's name",
+        ),
+        (missing, "a name O does not have"),
+    ] {
+        assert_denied(
+            f.acl()
+                .execute(&req(scope.clone()), f.grantee, Some(f.t1))
+                .await,
+            what,
+        );
+        assert_denied(
+            f.acl().preview(&req(scope), f.grantee, Some(f.t1)).await,
+            what,
+        );
+    }
+    f.assert_untouched("names never reach grants").await;
+    // By id the same grant does reach it.
+    f.acl()
+        .execute(
+            &req(DeleteScope::DatasetById {
+                dataset_id: f.o_t1.0,
+            }),
+            f.grantee,
+            Some(f.t1),
+        )
+        .await
+        .unwrap();
+    assert!(!f.dataset_exists(f.o_t1.0).await);
 }
 
 #[tokio::test]
@@ -422,7 +469,7 @@ async fn plain_by_name_dataset_resolves_only_in_scope_tenant() {
 }
 
 // ---------------------------------------------------------------------------
-// E3 item by id (`DataInDataset`)
+// item by id (`DataInDataset`)
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -462,7 +509,7 @@ async fn data_in_dataset_other_tenant_grant_denied() {
 }
 
 // ---------------------------------------------------------------------------
-// E4 item by dataset name (`Data{Some(name)}`)
+// item by dataset name (`Data{Some(name)}`)
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -540,7 +587,7 @@ async fn plain_data_by_name_resolves_only_in_scope_tenant() {
 }
 
 // ---------------------------------------------------------------------------
-// E5 item without dataset (`Data{None}`)
+// item without dataset (`Data{None}`)
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -559,7 +606,7 @@ async fn dataset_less_item_refused_under_acl() {
         );
         assert_validation(svc.preview(&req(scope), principal, tenant).await, what);
     }
-    f.assert_untouched("E5").await;
+    f.assert_untouched("dataset-less item").await;
 }
 
 #[tokio::test]
@@ -585,7 +632,7 @@ async fn plain_dataset_less_item_detaches_only_owner_links_in_tenant() {
 }
 
 // ---------------------------------------------------------------------------
-// E6a `All` (ACL: the caller's delete-authorized datasets in its tenant)
+// `All` (ACL: the caller's delete-authorized datasets in its tenant)
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -630,7 +677,7 @@ async fn all_ignores_grants_in_other_tenant() {
 }
 
 // ---------------------------------------------------------------------------
-// E6b `User`
+// `User`
 // ---------------------------------------------------------------------------
 
 fn user(owner: Uuid, tenant: Option<Uuid>) -> DeleteScope {
@@ -640,28 +687,62 @@ fn user(owner: Uuid, tenant: Option<Uuid>) -> DeleteScope {
     }
 }
 
+/// `User` never deletes search history, like Python's `delete_all` /
+/// `_forget_everything` (`datasets.py:316-323`, `forget.py:191-221`
+/// @37f788bd2). The history table has no tenant column, so O's history from
+/// its work in T1 and T2 must survive a `User{O, T1}` (and a `User{O, T2}`).
 #[tokio::test]
-async fn user_scope_owner_deletes_own_tenant_datasets_and_history() {
+async fn user_scope_owner_deletes_own_tenant_datasets_and_keeps_history() {
     let f = fixture().await;
-    f.log_history(f.owner).await;
+    f.log_history(f.owner).await; // a T1 session
+    f.log_history(f.owner).await; // a T2 session
     let preview = f
         .acl()
         .preview(&req(user(f.owner, Some(f.t1))), f.owner, Some(f.t1))
         .await
         .unwrap();
     assert_eq!(preview.datasets_to_delete, 1);
-    assert_eq!(preview.search_queries_to_delete, 1);
+    assert_eq!(preview.search_queries_to_delete, 0);
     let result = f
         .acl()
         .execute(&req(user(f.owner, Some(f.t1))), f.owner, Some(f.t1))
         .await
         .unwrap();
     assert_eq!(result.deleted_datasets, 1);
-    assert_eq!(result.deleted_search_queries, 1);
-    assert_eq!(f.history(f.owner).await, 0);
+    assert_eq!(result.deleted_search_queries, 0);
+    assert_eq!(f.history(f.owner).await, 2, "history spans tenants: kept");
     assert!(!f.dataset_exists(f.o_t1.0).await);
     assert!(f.dataset_exists(f.o_t2.0).await);
     assert!(f.dataset_exists(f.o_none.0).await);
+
+    // The same from T2: its dataset goes, the history still stays.
+    f.acl()
+        .execute(&req(user(f.owner, Some(f.t2))), f.owner, Some(f.t2))
+        .await
+        .unwrap();
+    assert!(!f.dataset_exists(f.o_t2.0).await);
+    assert_eq!(f.history(f.owner).await, 2);
+}
+
+#[tokio::test]
+async fn plain_user_scope_keeps_history_across_tenants() {
+    let f = fixture().await;
+    f.log_history(f.owner).await;
+    f.log_history(f.owner).await;
+    let preview = f
+        .plain()
+        .preview(&req(user(f.owner, Some(f.t1))))
+        .await
+        .unwrap();
+    assert_eq!(preview.search_queries_to_delete, 0);
+    let result = f
+        .plain()
+        .execute(&req(user(f.owner, Some(f.t1))))
+        .await
+        .unwrap();
+    assert_eq!(result.deleted_search_queries, 0);
+    assert_eq!(f.history(f.owner).await, 2);
+    assert!(f.dataset_exists(f.o_t2.0).await);
 }
 
 #[tokio::test]
@@ -754,7 +835,7 @@ async fn plain_user_scope_is_tenant_scoped() {
 }
 
 // ---------------------------------------------------------------------------
-// E6c stop at the first error
+// stop at the first error
 // ---------------------------------------------------------------------------
 
 /// A second owner P with two datasets in T1, granted to itself; returns P
@@ -855,7 +936,7 @@ async fn plain_user_scope_stops_at_first_failure_with_partial() {
 }
 
 // ---------------------------------------------------------------------------
-// W5: a missing item inside a dataset honours `delete_dataset_if_empty`
+// A missing item inside a dataset honours `delete_dataset_if_empty`
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -873,7 +954,7 @@ async fn ghost_item_in_dataset_deletes_empty_dataset_when_flagged() {
         .unwrap();
     assert_eq!(result.deleted_datasets, 1);
     assert!(!f.dataset_exists(empty).await);
-    f.assert_untouched("W5").await;
+    f.assert_untouched("ghost item").await;
 }
 
 #[tokio::test]
@@ -906,7 +987,7 @@ async fn ghost_item_keeps_non_empty_dataset() {
         .await
         .unwrap();
     assert_eq!(result.deleted_datasets, 0);
-    f.assert_untouched("W5 non-empty").await;
+    f.assert_untouched("ghost item, non-empty dataset").await;
 }
 
 #[tokio::test]
@@ -936,6 +1017,6 @@ async fn ghost_item_by_dataset_name_honours_flag() {
                 tenant_id: None,
             }))
             .await,
-        "W5 name in another tenant",
+        "ghost item, name in another tenant",
     );
 }

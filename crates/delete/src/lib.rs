@@ -138,8 +138,10 @@ pub enum DeleteScope {
     /// deleted one after another by id, stopping at the first failure — like
     /// Python's `forget(everything=True)` → `datasets.delete_all(user)`
     /// (`cognee/api/v1/forget/forget.py:191-205@37f788bd2`,
-    /// `cognee/api/v1/datasets/datasets.py:316-323@37f788bd2`). The owner's
-    /// search history is cleared once every dataset is gone.
+    /// `cognee/api/v1/datasets/datasets.py:316-323@37f788bd2`). Like Python
+    /// it does **not** delete search history: the history table has no tenant
+    /// or dataset column, so clearing it here would reach the owner's other
+    /// tenants.
     User {
         owner_id: Uuid,
         /// The tenant whose datasets are deleted; `None` ⇔ tenant-less ones.
@@ -388,7 +390,7 @@ impl DeleteService {
             let ids = self
                 .owner_dataset_ids_in_tenant(*owner_id, *tenant_id)
                 .await?;
-            return self.preview_user_datasets(*owner_id, &ids, true).await;
+            return self.preview_datasets_by_id(&ids).await;
         }
         self.preview_resolved(request).await
     }
@@ -401,8 +403,7 @@ impl DeleteService {
     ) -> Result<DeletePreview, DeleteError> {
         let targets = self.resolve_targets(request).await?;
         let search_queries_to_delete = match &request.scope {
-            // Expanded by `preview` into `preview_user_datasets`, which counts
-            // the owner's history itself.
+            // Expanded by `preview` per dataset; never counts history.
             DeleteScope::User { .. } => 0,
             DeleteScope::All => self
                 .database
@@ -438,30 +439,6 @@ impl DeleteService {
         }
         let targets = self.resolve_dataset_list(datasets).await?;
         self.preview_targets(targets, 0).await
-    }
-
-    /// Preview a `User` delete of `owner_id` over the already-chosen
-    /// `dataset_ids` (union, see [`Self::preview_datasets_by_id`]), plus the
-    /// owner's search history when `count_search_history` holds.
-    pub(crate) async fn preview_user_datasets(
-        &self,
-        owner_id: Uuid,
-        dataset_ids: &[Uuid],
-        count_search_history: bool,
-    ) -> Result<DeletePreview, DeleteError> {
-        let mut preview = self.preview_datasets_by_id(dataset_ids).await?;
-        if count_search_history {
-            preview.search_queries_to_delete = self
-                .database
-                .count_search_history_for_user(owner_id)
-                .await
-                .map_err(|e| {
-                    DeleteError::Runtime(format!(
-                        "Failed to count search history for user {owner_id}: {e}"
-                    ))
-                })? as usize;
-        }
-        Ok(preview)
     }
 
     /// The ids of the datasets `owner_id` owns in `tenant_id` (strict
@@ -531,34 +508,6 @@ impl DeleteService {
         Ok(total)
     }
 
-    /// Execute a `User` delete of `owner_id` over the already-chosen
-    /// `dataset_ids`: [`Self::execute_datasets_by_id`], then — only when every
-    /// dataset was deleted, `clear_search_history` holds and the request is
-    /// not memory-only — the owner's search history.
-    pub(crate) async fn execute_user_datasets(
-        &self,
-        owner_id: Uuid,
-        dataset_ids: &[Uuid],
-        request: &DeleteRequest,
-        clear_search_history: bool,
-    ) -> Result<DeleteResult, DeleteError> {
-        let mut result = self
-            .execute_datasets_by_id(dataset_ids, request.mode.clone(), request.memory_only)
-            .await?;
-        if clear_search_history && !request.memory_only {
-            result.deleted_search_queries += self
-                .database
-                .delete_search_history_for_user(owner_id)
-                .await
-                .map_err(|e| {
-                    DeleteError::Runtime(format!(
-                        "Failed to delete search history for user {owner_id}: {e}"
-                    ))
-                })? as usize;
-        }
-        Ok(result)
-    }
-
     async fn preview_targets(
         &self,
         targets: ResolvedDeleteTargets,
@@ -618,7 +567,7 @@ impl DeleteService {
                 .owner_dataset_ids_in_tenant(*owner_id, *tenant_id)
                 .await?;
             return self
-                .execute_user_datasets(*owner_id, &ids, request, true)
+                .execute_datasets_by_id(&ids, request.mode.clone(), request.memory_only)
                 .await;
         }
         self.execute_resolved(request).await
@@ -920,8 +869,8 @@ impl DeleteService {
         // ------------------------------------------------------------------
 
         let deleted_search_queries = match &request.scope {
-            // Expanded by `execute` into `execute_user_datasets`, which clears
-            // the owner's history once every dataset is gone.
+            // Expanded by `execute` per dataset; history is never deleted for
+            // `User` (Python `delete_all` does not, and the table has no tenant).
             DeleteScope::User { .. } => 0,
             DeleteScope::All => self
                 .database
@@ -1808,7 +1757,7 @@ impl DeleteService {
         delete_dataset_if_empty: bool,
     ) -> Result<ResolvedDeleteTargets, DeleteError> {
         // A named dataset is resolved before the ghost check, so a missing
-        // Data row inside it can honour `delete_dataset_if_empty` (W5).
+        // Data row inside it can honour `delete_dataset_if_empty`.
         let named_dataset = match dataset_name {
             Some(dataset_name) => Some(
                 self.dataset_by_name_in_tenant(owner_id, dataset_name, tenant_id)
@@ -1821,13 +1770,13 @@ impl DeleteService {
             DeleteError::Runtime(format!("Failed to fetch data {data_id}: {error}"))
         })?;
 
-        // Python behaviour (datasets.py:165-176): when the Data row is absent the
-        // caller may be using a custom graph model that didn't go through the
-        // standard ingestion pipeline. In that case we still attempt graph/vector
-        // cleanup using a minimal ghost targets struct (candidate_data_ids set, no
-        // links to detach) and return success rather than an error. With a
-        // named dataset, the dataset is deleted too when the flag is set and it
-        // holds no data (`datasets.py:259-273@37f788bd2`).
+        // Python behaviour (`datasets.py:253-273@37f788bd2`): when the Data
+        // row is absent the caller may be using a custom graph model that
+        // didn't go through the standard ingestion pipeline. In that case we
+        // still attempt graph/vector cleanup using a minimal ghost targets
+        // struct (candidate_data_ids set, no links to detach) and return
+        // success rather than an error. With a named dataset, the dataset is
+        // deleted too when the flag is set and it holds no data.
         let Some(data) = data else {
             tracing::warn!(
                 data_id = %data_id,
@@ -1959,7 +1908,7 @@ impl DeleteService {
             })
     }
 
-    /// Targets for an item with no `Data` row inside `dataset` (W5): Python
+    /// Targets for an item with no `Data` row inside `dataset`: Python
     /// `delete_data` finds no such item among the dataset's data, cleans up
     /// the graph for it, then deletes the dataset when it holds no data and
     /// `delete_dataset_if_empty` is set
@@ -2017,7 +1966,7 @@ impl DeleteService {
     /// (`datasets.py:259-273@37f788bd2`, see `ghost_targets`).
     ///
     /// An existing item that is not in the dataset is refused — a documented
-    /// divergence until per-dataset storage (S4b): Python returns success
+    /// divergence until datasets get their own storage: Python returns success
     /// there after a graph cleanup inside that dataset's own databases, which
     /// cannot reach other datasets, but here the graph and vector stores are
     /// shared and the cleanup would reach every dataset the item belongs to.
@@ -4257,11 +4206,9 @@ mod tests {
         let result = svc
             .execute(
                 &DeleteRequest {
-                    scope: DeleteScope::Dataset {
-                        owner_id: owner_a,
-                        dataset_name: "acl_delegated".to_string(),
-                        tenant_id: None,
-                    },
+                    // Grant reach goes only through ids: a by-name scope
+                    // must name the caller's own dataset.
+                    scope: DeleteScope::DatasetById { dataset_id },
                     mode: DeleteMode::Soft,
                     memory_only: false,
                 },
@@ -4333,7 +4280,7 @@ mod tests {
     // ------------------------------------------------------------------
 
     /// Scenario: `delete` granted to a *role*; the caller holds the role.
-    /// Exercises `require_delete_permission` (Dataset scope →
+    /// Exercises `require_delete_permission` (by-id scope →
     /// `has_permission_in_tenant`).
     #[tokio::test]
     async fn authorized_delete_via_role_grant_dataset_scope() {
@@ -4360,11 +4307,9 @@ mod tests {
         let result = svc
             .execute(
                 &DeleteRequest {
-                    scope: DeleteScope::Dataset {
-                        owner_id: owner,
-                        dataset_name: "acl_role_ds".to_string(),
-                        tenant_id: None,
-                    },
+                    // Grant reach goes only through ids: a by-name scope
+                    // must name the caller's own dataset.
+                    scope: DeleteScope::DatasetById { dataset_id },
                     mode: DeleteMode::Soft,
                     memory_only: false,
                 },
@@ -5096,7 +5041,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn user_scoped_delete_clears_search_history() {
+    async fn user_scoped_delete_keeps_search_history() {
         let (svc, storage, db) = make_service().await;
         let user_a = Uuid::new_v4();
         let user_b = Uuid::new_v4();
@@ -5132,15 +5077,19 @@ mod tests {
             .await
             .expect("execute should succeed");
 
-        assert_eq!(result.deleted_search_queries, 3);
+        // Python's `delete_all` never deletes search history
+        // (`datasets.py:316-323@37f788bd2`), and the history table has no
+        // tenant: clearing it from a tenant-scoped `User` delete would reach
+        // the user's other tenants.
+        assert_eq!(result.deleted_search_queries, 0);
+        assert_eq!(result.deleted_datasets, 1);
 
-        // User A's search history should be gone
         let count_a_after = ops::search_history::count_queries_by_user(&db, user_a)
             .await
             .unwrap();
         assert_eq!(
-            count_a_after, 0,
-            "user A's search history should be deleted"
+            count_a_after, 3,
+            "user A's search history must survive a User-scoped delete"
         );
 
         // User B's search history should remain
@@ -5248,8 +5197,8 @@ mod tests {
             .expect("preview should succeed");
 
         assert_eq!(
-            preview.search_queries_to_delete, 5,
-            "preview should show correct search query count for user scope"
+            preview.search_queries_to_delete, 0,
+            "a User-scoped delete never deletes search history"
         );
 
         // All-scoped preview
@@ -6346,7 +6295,7 @@ mod tests {
     /// graph model or orphaned graph data), `DeleteScope::Data` must succeed and
     /// return a best-effort cleanup result rather than a validation error.
     ///
-    /// Python parity: `datasets.py:165-176`.
+    /// Python parity: `datasets.py:253-273@37f788bd2`.
     #[tokio::test]
     async fn delete_data_without_relational_row_returns_success() {
         let (svc, _storage, _db) = make_service().await;
