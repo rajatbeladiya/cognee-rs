@@ -17,6 +17,11 @@ pub trait AclDb: Send + Sync {
     /// Check if a principal has a specific permission on a dataset.
     ///
     /// Returns `true` if a matching ACL row exists (direct principal match).
+    ///
+    /// # Not an authorization check
+    /// Direct grants only (no tenant or role inheritance) and **no tenant
+    /// filter**: a direct grant on another tenant's dataset answers `true`.
+    /// Use [`Self::has_permission_in_tenant`] to authorize data access.
     async fn has_permission(
         &self,
         principal_id: Uuid,
@@ -77,7 +82,10 @@ pub trait AclDb: Send + Sync {
     ///
     /// This is the answer to "which datasets may this user read" in Python:
     /// `get_all_user_permission_datasets` unions the direct, tenant and role
-    /// grants and then keeps only `dataset.tenant_id == user.tenant_id`
+    /// grants (Python also unions the grants of the user's *agents*,
+    /// `get_all_user_permission_datasets.py:26-30@37f788bd2` — not modelled by
+    /// this trait, a pre-existing divergence) and then keeps only
+    /// `dataset.tenant_id == user.tenant_id`
     /// (`cognee/modules/users/permissions/methods/get_all_user_permission_datasets.py:49-53`
     /// @37f788bd2). `authorized_dataset_ids_with_roles` deliberately spans every
     /// tenant the user belongs to, so a caller that authorizes data access must
@@ -96,9 +104,15 @@ pub trait AclDb: Send + Sync {
     /// May `user_id` exercise `permission_name` on `dataset_id` *as a member
     /// of `tenant_id`*? True iff `dataset_id` is in
     /// [`Self::authorized_dataset_ids_in_tenant`]`(user_id, permission_name,
-    /// tenant_id)`: direct ∪ tenant ∪ role grants, then **strict**
+    /// tenant_id)`: direct ∪ tenant ∪ role grants (Python also counts the
+    /// user's agents' grants; see the note there), then **strict**
     /// `dataset.tenant_id == tenant_id` (`None` admits only datasets with no
     /// tenant). An unknown dataset id is `false`.
+    ///
+    /// `tenant_id` must be the caller's own **authenticated** current tenant
+    /// (Python reads `user.tenant_id` off the resolved user), never a value
+    /// taken from the request: the filter is only as trustworthy as the tenant
+    /// it is given.
     ///
     /// Python: `check_permission_on_dataset` / `get_authorized_dataset` →
     /// `get_specific_user_permission_datasets(user, perm, [id])`, which

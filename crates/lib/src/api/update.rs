@@ -184,7 +184,7 @@ pub async fn update(
 /// Uses the roles-aware, tenant-filtered check: Python authorizes `update()`
 /// through the dataset ACL (`ingest_data` →
 /// `get_specific_user_permission_datasets(user.id, "write", [dataset_id])`,
-/// `cognee/modules/pipelines/layers/resolve_authorized_user_datasets.py:39`,
+/// `cognee/tasks/ingestion/ingest_data.py:212`,
 /// `cognee/modules/users/permissions/methods/get_specific_user_permission_datasets.py:27-38`
 /// @37f788bd2), which walks the caller's tenant and role grants as well as
 /// direct ones and then keeps only datasets with `tenant_id == user.tenant_id`

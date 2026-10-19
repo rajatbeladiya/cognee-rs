@@ -32,6 +32,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   | `DatasetManager` per-id methods under an ACL | unknown id `NotFound`; cross-tenant grant admitted | `PermissionDenied` for unknown id, no grant and other tenant |
   | `DatasetManager::list_datasets` without an ACL | every owned dataset | owned datasets with `tenant_id == tenant_id` |
   | `AuthorizedDeleteService::{preview, execute}` | `(request, principal_id)` | `(request, principal_id, tenant_id)` |
+  | `AuthorizedDeleteService` `DeleteScope::All` | delete **everything** if the caller covers every dataset in the DB, else `PermissionDenied` naming one | delete, by id, the caller's `delete`-authorized datasets in its tenant (Python `datasets.delete_all`); no system-wide graph/vector/search-history wipe |
+  | `AuthorizedDeleteService` User-cover denial message | names the uncovered dataset | generic (`delete permission denied for the requested scope`) |
+  | `DatasetManager::delete_all` | lists `read`-authorized (ACL) / owned datasets and deletes each **by name** | lists `delete`-authorized in tenant (ACL) / owned in tenant, deletes each **by id** |
+  | `cognee-cli search` / `recall` | no tenant | new `--tenant-id` (strict match) |
   | `cognee::api::update` denial | `ApiError::InvalidArgument` | new `ApiError::PermissionDenied(String)` |
   | `SearchOrchestrator` without an ACL, `tenant_id: None` | no tenant filter for ids and names | tenant-less datasets only |
   | Bindings `list_datasets` / `delete_all_datasets` | every owned dataset | tenant-less datasets only (the handle user has no tenant) |
@@ -52,9 +56,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   Callers pass the caller's tenant: `mgr.list_datasets(owner, tenant)`,
   `auth_svc.execute(&req, principal, tenant)`. `match`es on `ApiError` add the
-  `PermissionDenied` arm. Data written with a per-call `tenant` opt is no
-  longer listed or deleted by the tenant-less binding dataset ops, and is not
-  reachable from a tenant-less search (Python parity).
+  `PermissionDenied` arm. Data written with a per-call `tenant` opt (or
+  `cognee-cli add/remember/improve --tenant-id`) is no longer listed or deleted
+  by the tenant-less binding dataset ops, and is not reachable from a
+  tenant-less search; pass the same tenant on read (`cognee-cli search/recall
+  --tenant-id`, the bindings' `tenant` search opt) (Python parity).
+  Without an ACL the `DatasetManager` per-id methods still perform no
+  ownership or tenant check.
 
 - **`cognee-cognify`: summarization is re-typed over `ExtractedChunks`, and the
   two graph/summarize pipeline stages are now one.** Graph extraction and
