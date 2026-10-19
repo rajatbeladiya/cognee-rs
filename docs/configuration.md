@@ -1529,8 +1529,22 @@ What an attached `AclDb` changes for search and recall:
   rather than answered empty or across datasets the caller may not read.
   `FEEDBACK` is not dataset data and is not scoped.
 
+The per-dataset checks outside search — `DatasetManager` (`list_data`,
+`has_data`, `empty_dataset`, `delete_data`), `AuthorizedDeleteService` and
+`cognee::api::update` — use `AclDb::has_permission_in_tenant` with the caller's
+tenant, strict equality. A grant on another tenant's dataset is
+`PermissionDenied`, exactly like no grant at all (Python's single
+`PermissionDeniedError`, HTTP 403); under an ACL an unknown dataset id is
+`PermissionDenied` too, never "not found". `DatasetManager::list_datasets`,
+`delete_all` and the `AuthorizedDeleteService` user/all covers count only
+grants on datasets in the caller's tenant.
+
 Without an `AclDb`, an unfiltered search stays unscoped and every type runs, as
-in Python's non-ACL mode.
+in Python's non-ACL mode. The ownership fallback that replaces the ACL — explicit
+`dataset_ids`, dataset names and `DatasetManager::list_datasets` — also keeps
+only datasets whose tenant equals the caller's: a tenant-less caller (`None`)
+sees only tenant-less datasets (Python `get_dataset_ids.py:34`,
+`get_all_user_permission_datasets.py:49-53`).
 
 > **Migrating from Python:** Python's `.env.template` ships an uncommented
 > `ENABLE_BACKEND_ACCESS_CONTROL=True`. A `.env` copied from it (cognee-rust loads

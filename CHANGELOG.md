@@ -18,6 +18,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking changes
 
+- **Tenant-filtered per-dataset permission checks; strict tenant-less
+  fallback (SDK-974, SDK-687, SDK-689).** Every per-id check now applies the
+  caller's tenant like Python (`dataset.tenant_id == user.tenant_id`, strict:
+  `None` reaches only tenant-less datasets), and a grant on another tenant's
+  dataset is denied with the same error as no grant.
+
+  | Item | Before | After |
+  |---|---|---|
+  | `AclDb::has_permission_with_roles` | required method | **removed** |
+  | `AclDb::has_permission_in_tenant(user, dataset, perm, tenant)` | — | new, provided (default = membership in `authorized_dataset_ids_in_tenant`) |
+  | `DatasetManager::{list_datasets, list_data, has_data, empty_dataset, delete_data, delete_all}` | `(…, owner_id, …)` | `(…, owner_id, tenant_id: Option<Uuid>, …)` |
+  | `DatasetManager` per-id methods under an ACL | unknown id `NotFound`; cross-tenant grant admitted | `PermissionDenied` for unknown id, no grant and other tenant |
+  | `DatasetManager::list_datasets` without an ACL | every owned dataset | owned datasets with `tenant_id == tenant_id` |
+  | `AuthorizedDeleteService::{preview, execute}` | `(request, principal_id)` | `(request, principal_id, tenant_id)` |
+  | `cognee::api::update` denial | `ApiError::InvalidArgument` | new `ApiError::PermissionDenied(String)` |
+  | `SearchOrchestrator` without an ACL, `tenant_id: None` | no tenant filter for ids and names | tenant-less datasets only |
+  | Bindings `list_datasets` / `delete_all_datasets` | every owned dataset | tenant-less datasets only (the handle user has no tenant) |
+  | `HandleState::tenant_id()` | — | new accessor |
+
+  **Migration.** An external `AclDb` impl deletes its `has_permission_with_roles`
+  (it is no longer a trait member) and may override `has_permission_in_tenant`
+  for an O(1) path that gives the same answer:
+
+  ```rust
+  async fn has_permission_in_tenant(
+      &self, user_id: Uuid, dataset_id: Uuid, perm: &str, tenant_id: Option<Uuid>,
+  ) -> Result<bool, DatabaseError> {
+      // dataset row exists with dataset.tenant_id == tenant_id (NULL for None)
+      // AND a direct / tenant / role grant of `perm` on it
+  }
+  ```
+
+  Callers pass the caller's tenant: `mgr.list_datasets(owner, tenant)`,
+  `auth_svc.execute(&req, principal, tenant)`. `match`es on `ApiError` add the
+  `PermissionDenied` arm. Data written with a per-call `tenant` opt is no
+  longer listed or deleted by the tenant-less binding dataset ops, and is not
+  reachable from a tenant-less search (Python parity).
+
 - **`cognee-cognify`: summarization is re-typed over `ExtractedChunks`, and the
   two graph/summarize pipeline stages are now one.** Graph extraction and
   summarization run concurrently, as Python's single `extract_graph_and_summarize`
