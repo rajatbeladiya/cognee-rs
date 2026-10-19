@@ -125,8 +125,16 @@ pub trait AclDb: Send + Sync {
     /// `cognee/modules/users/exceptions/exceptions.py:42-51` @37f788bd2)
     ///
     /// The default is correct for every implementation because it is built on
-    /// the required, tenant-filtered listing; override it only for speed and
-    /// keep the same answer.
+    /// the required, tenant-filtered listing — but it costs **one full grant
+    /// listing per point check** (and a caller that checks N datasets pays N
+    /// listings). It exists so a provider stays registrable without it, and so
+    /// `MockAclDb` exercises the reference semantics.
+    ///
+    /// # Production implementations MUST override this
+    /// with a point query that gives the same answer: the `dataset` row with
+    /// `id = dataset_id` and the strict tenant predicate
+    /// (`tenant_id = $t`, or `tenant_id IS NULL` for `None`), joined with a
+    /// direct / tenant / role grant of `permission_name` for `user_id`.
     async fn has_permission_in_tenant(
         &self,
         user_id: Uuid,
