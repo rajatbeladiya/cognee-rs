@@ -582,40 +582,107 @@ async fn user_scope_cover_excludes_grants_in_another_tenant() {
     .expect("User scope with every owner dataset in the caller's tenant is admitted");
 }
 
+/// `DeleteScope::All` is Python's `datasets.delete_all`
+/// (`datasets.py:316-323@37f788bd2`): it deletes the caller's
+/// `delete`-authorized datasets **in its tenant** and nothing else, so a
+/// multi-tenant DB does not make it fail, and other tenants' datasets and
+/// ungranted ones survive.
 #[tokio::test]
-async fn all_scope_cover_excludes_grants_in_another_tenant() {
+async fn all_scope_deletes_only_the_callers_delete_authorized_datasets_in_its_tenant() {
     let (db, storage, acl) = setup().await;
     let caller = Uuid::new_v4();
+    let other = Uuid::new_v4();
     let t1 = Uuid::new_v4();
     let t2 = Uuid::new_v4();
-    let (in_t1, data_t1) = seed_in_tenant(&db, &storage, &acl, caller, "in_t1", Some(t1)).await;
-    let (in_t2, _) = seed_in_tenant(&db, &storage, &acl, caller, "in_t2", Some(t2)).await;
+    let (in_t1, data_t1) = seed_in_tenant(&db, &storage, &acl, other, "in_t1", Some(t1)).await;
+    let (in_t2, data_t2) = seed_in_tenant(&db, &storage, &acl, other, "in_t2", Some(t2)).await;
+    let (ungranted_t1, _) = seed_in_tenant(&db, &storage, &acl, other, "ungranted", Some(t1)).await;
     grant_delete_permission(&acl, caller, in_t1).await;
     grant_delete_permission(&acl, caller, in_t2).await;
     let svc = build_authorized_service(&db, &storage, &acl);
 
-    assert_denied(
-        svc.execute(&request(DeleteScope::All), caller, Some(t1))
-            .await,
-        "All scope with a dataset in T2",
+    let preview = svc
+        .preview(&request(DeleteScope::All), caller, Some(t1))
+        .await
+        .expect("All preview in T1");
+    assert_eq!(preview.datasets_to_delete, 1);
+
+    let result = svc
+        .execute(&request(DeleteScope::All), caller, Some(t1))
+        .await
+        .expect("All in T1 is not denied by T2's dataset");
+    assert_eq!(result.deleted_datasets, 1);
+    assert!(
+        database::ops::datasets::get_dataset(&db, in_t1)
+            .await
+            .unwrap()
+            .is_none()
     );
     assert!(
         database::ops::data::get_data(&db, data_t1)
             .await
             .unwrap()
-            .is_some(),
-        "nothing is deleted when the cover fails"
+            .is_none()
+    );
+    for survivor in [in_t2, ungranted_t1] {
+        assert!(
+            database::ops::datasets::get_dataset(&db, survivor)
+                .await
+                .unwrap()
+                .is_some(),
+            "a dataset outside the caller's delete grants in T1 must survive"
+        );
+    }
+    assert!(
+        database::ops::data::get_data(&db, data_t2)
+            .await
+            .unwrap()
+            .is_some()
     );
 
-    let (db, storage, acl) = setup().await;
-    let (a, _) = seed_in_tenant(&db, &storage, &acl, caller, "a", Some(t1)).await;
-    let (b, _) = seed_in_tenant(&db, &storage, &acl, caller, "b", Some(t1)).await;
-    grant_delete_permission(&acl, caller, a).await;
-    grant_delete_permission(&acl, caller, b).await;
-    let svc = build_authorized_service(&db, &storage, &acl);
-    svc.execute(&request(DeleteScope::All), caller, Some(t1))
+    // Tenant-less caller: holds grants only on tenanted datasets → nothing.
+    let result = svc
+        .execute(&request(DeleteScope::All), caller, None)
         .await
-        .expect("All scope with every dataset in the caller's tenant is admitted");
+        .expect("All with nothing deletable is an empty success");
+    assert_eq!(result.deleted_datasets, 0);
+    assert!(
+        database::ops::datasets::get_dataset(&db, in_t2)
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+/// A denied User cover must not name the uncovered dataset — it may be in a
+/// tenant the caller cannot see.
+#[tokio::test]
+async fn user_scope_denial_does_not_name_the_uncovered_dataset() {
+    let (db, storage, acl) = setup().await;
+    let owner = Uuid::new_v4();
+    let t1 = Uuid::new_v4();
+    let t2 = Uuid::new_v4();
+    let (in_t1, _) = seed_in_tenant(&db, &storage, &acl, owner, "visible_t1", Some(t1)).await;
+    let _ = seed_in_tenant(&db, &storage, &acl, owner, "secret_t2_name", Some(t2)).await;
+    grant_delete_permission(&acl, owner, in_t1).await;
+    let svc = build_authorized_service(&db, &storage, &acl);
+
+    match svc
+        .execute(
+            &request(DeleteScope::User { owner_id: owner }),
+            owner,
+            Some(t1),
+        )
+        .await
+    {
+        Err(DeleteError::PermissionDenied(msg)) => {
+            assert!(
+                !msg.contains("secret_t2_name"),
+                "leaks a dataset name: {msg}"
+            );
+        }
+        other => panic!("expected PermissionDenied, got {other:?}"),
+    }
 }
 
 #[tokio::test]

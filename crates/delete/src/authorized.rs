@@ -47,27 +47,110 @@ impl AuthorizedDeleteService {
     }
 
     /// Preview the deletion, checking ACL first.
+    ///
+    /// [`DeleteScope::All`] is previewed as the sum over the caller's
+    /// `delete`-authorized datasets in `tenant_id` (see [`Self::execute`]).
     pub async fn preview(
         &self,
         request: &DeleteRequest,
         principal_id: Uuid,
         tenant_id: Option<Uuid>,
     ) -> Result<DeletePreview, DeleteError> {
+        if matches!(request.scope, DeleteScope::All) {
+            let mut total = DeletePreview::default();
+            for dataset_id in self.deletable_in_tenant(principal_id, tenant_id).await? {
+                let p = self.inner.preview(&by_id(request, dataset_id)).await?;
+                total.datasets_to_delete += p.datasets_to_delete;
+                total.dataset_links_to_delete += p.dataset_links_to_delete;
+                total.data_to_delete += p.data_to_delete;
+                total.storage_files_to_delete += p.storage_files_to_delete;
+                total.graph_nodes_to_delete += p.graph_nodes_to_delete;
+                total.vector_points_to_delete += p.vector_points_to_delete;
+                total.provenance_nodes_to_delete += p.provenance_nodes_to_delete;
+                total.provenance_edges_to_delete += p.provenance_edges_to_delete;
+                total.search_queries_to_delete += p.search_queries_to_delete;
+                total.orphaned_edge_types_to_delete += p.orphaned_edge_types_to_delete;
+            }
+            return Ok(total);
+        }
         self.check_authorization(request, principal_id, tenant_id)
             .await?;
         self.inner.preview(request).await
     }
 
     /// Execute the deletion, checking ACL first.
+    ///
+    /// [`DeleteScope::All`] is **not** a database-wide wipe here: like Python's
+    /// `datasets.delete_all`, which enumerates
+    /// `get_authorized_existing_datasets([], "delete", user)` and empties each
+    /// (`cognee/api/v1/datasets/datasets.py:316-323@37f788bd2`), it deletes —
+    /// by id — every dataset the caller holds `delete` on in `tenant_id`, and
+    /// leaves everything else (other tenants, ungranted datasets) alone. It
+    /// therefore cannot be denied by a dataset the caller cannot see. The
+    /// system-wide artifacts of the plain [`DeleteService`]'s `All` (whole
+    /// graph/vector wipe, all search history) are not touched.
     pub async fn execute(
         &self,
         request: &DeleteRequest,
         principal_id: Uuid,
         tenant_id: Option<Uuid>,
     ) -> Result<DeleteResult, DeleteError> {
+        if matches!(request.scope, DeleteScope::All) {
+            let mut total = DeleteResult::default();
+            for dataset_id in self.deletable_in_tenant(principal_id, tenant_id).await? {
+                let r = self.inner.execute(&by_id(request, dataset_id)).await?;
+                total.deleted_datasets += r.deleted_datasets;
+                total.deleted_dataset_links += r.deleted_dataset_links;
+                total.deleted_data += r.deleted_data;
+                total.deleted_storage_files += r.deleted_storage_files;
+                total.deleted_graph_nodes += r.deleted_graph_nodes;
+                total.deleted_vector_points += r.deleted_vector_points;
+                total.deleted_provenance_nodes += r.deleted_provenance_nodes;
+                total.deleted_provenance_edges += r.deleted_provenance_edges;
+                total.deleted_orphan_entities += r.deleted_orphan_entities;
+                total.deleted_orphan_entity_types += r.deleted_orphan_entity_types;
+                total.deleted_orphan_edge_types += r.deleted_orphan_edge_types;
+                total.deleted_pipeline_runs += r.deleted_pipeline_runs;
+                total.cleared_pipeline_statuses += r.cleared_pipeline_statuses;
+                total.deleted_search_queries += r.deleted_search_queries;
+                total.pruned_sessions |= r.pruned_sessions;
+                total.warnings.extend(r.warnings);
+            }
+            return Ok(total);
+        }
         self.check_authorization(request, principal_id, tenant_id)
             .await?;
         self.inner.execute(request).await
+    }
+
+    /// Existing datasets the principal holds `delete` on in `tenant_id`
+    /// (strict tenant equality), in listing order. Grants on ids with no
+    /// dataset row are dropped.
+    async fn deletable_in_tenant(
+        &self,
+        principal_id: Uuid,
+        tenant_id: Option<Uuid>,
+    ) -> Result<Vec<Uuid>, DeleteError> {
+        let authorized: HashSet<Uuid> = self
+            .acl_db
+            .authorized_dataset_ids_in_tenant(principal_id, "delete", tenant_id)
+            .await
+            .map_err(|e| DeleteError::Runtime(format!("ACL query failed: {e}")))?
+            .into_iter()
+            .collect();
+        if authorized.is_empty() {
+            return Ok(Vec::new());
+        }
+        let datasets = self
+            .database
+            .list_datasets()
+            .await
+            .map_err(|e| DeleteError::Runtime(format!("Failed to list all datasets: {e}")))?;
+        Ok(datasets
+            .into_iter()
+            .filter(|ds| authorized.contains(&ds.id))
+            .map(|ds| ds.id)
+            .collect())
     }
 
     /// Verify that `principal_id` has "delete" permission on all datasets
@@ -158,48 +241,41 @@ impl AuthorizedDeleteService {
                         DeleteError::Runtime(format!("Failed to list owner datasets: {e}"))
                     })?;
 
-                for ds in &owner_datasets {
-                    if !authorized.contains(&ds.id) {
-                        return Err(DeleteError::PermissionDenied(format!(
-                            "Principal {} does not have 'delete' permission on dataset '{}'",
-                            principal_id, ds.name
-                        )));
-                    }
+                // The denial names no dataset: the uncovered one may belong to
+                // another tenant (or another owner) the caller cannot see.
+                if let Some(ds) = owner_datasets
+                    .iter()
+                    .find(|ds| !authorized.contains(&ds.id))
+                {
+                    tracing::warn!(
+                        principal = %principal_id,
+                        dataset = %ds.id,
+                        "user-scope delete denied: dataset not covered by the caller's delete grants in its tenant"
+                    );
+                    return Err(DeleteError::PermissionDenied(
+                        "delete permission denied for the requested scope".to_string(),
+                    ));
                 }
             }
-            DeleteScope::All => {
-                // All-scope is an administrative operation. We check that
-                // the principal has delete permission on every dataset that
-                // exists. If any dataset lacks the permission, deny. Tenant-
-                // filtered like the User cover above (Python `datasets.py:
-                // 316-323@37f788bd2`): any dataset outside the caller's tenant
-                // fails the cover (fail closed).
-                let authorized: HashSet<Uuid> = self
-                    .acl_db
-                    .authorized_dataset_ids_in_tenant(principal_id, "delete", tenant_id)
-                    .await
-                    .map_err(|e| DeleteError::Runtime(format!("ACL query failed: {e}")))?
-                    .into_iter()
-                    .collect();
-
-                let all_datasets = self.database.list_datasets().await.map_err(|e| {
-                    DeleteError::Runtime(format!("Failed to list all datasets: {e}"))
-                })?;
-
-                for ds in &all_datasets {
-                    if !authorized.contains(&ds.id) {
-                        return Err(DeleteError::PermissionDenied(format!(
-                            "Principal {} does not have 'delete' permission on dataset '{}'",
-                            principal_id, ds.name
-                        )));
-                    }
-                }
-            }
+            // Enumerated in-tenant by `execute` / `preview` and never reaches
+            // here; a no-op arm keeps the match exhaustive.
+            DeleteScope::All => {}
         }
 
         Ok(())
     }
+}
 
+/// `request` with its scope replaced by `DatasetById { dataset_id }`.
+fn by_id(request: &DeleteRequest, dataset_id: Uuid) -> DeleteRequest {
+    DeleteRequest {
+        scope: DeleteScope::DatasetById { dataset_id },
+        mode: request.mode.clone(),
+        memory_only: request.memory_only,
+    }
+}
+
+impl AuthorizedDeleteService {
     /// Look up a dataset by name + owner and return its ID.
     async fn resolve_dataset_id(
         &self,
