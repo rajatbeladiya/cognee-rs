@@ -121,6 +121,7 @@ async fn dataset_deletion_removes_data_records() {
             scope: DeleteScope::Dataset {
                 owner_id,
                 dataset_name: "del_ds".to_string(),
+                tenant_id: None,
             },
             mode: DeleteMode::Soft,
             memory_only: false,
@@ -165,6 +166,7 @@ async fn dataset_deletion_removes_storage_files() {
             scope: DeleteScope::Dataset {
                 owner_id,
                 dataset_name: "storage_ds".to_string(),
+                tenant_id: None,
             },
             mode: DeleteMode::Soft,
             memory_only: false,
@@ -239,6 +241,7 @@ async fn shared_data_preserved_on_partial_delete() {
             scope: DeleteScope::Dataset {
                 owner_id,
                 dataset_name: "dataset_A".to_string(),
+                tenant_id: None,
             },
             mode: DeleteMode::Soft,
             memory_only: false,
@@ -291,6 +294,7 @@ async fn delete_data_with_dataset_if_empty_false_preserves_dataset() {
                 data_id,
                 dataset_name: Some("keep_ds".to_string()),
                 delete_dataset_if_empty: false,
+                tenant_id: None,
             },
             mode: DeleteMode::Soft,
             memory_only: false,
@@ -354,6 +358,7 @@ async fn delete_data_with_dataset_if_empty_true_removes_dataset() {
                 data_id,
                 dataset_name: Some("remove_ds".to_string()),
                 delete_dataset_if_empty: true,
+                tenant_id: None,
             },
             mode: DeleteMode::Soft,
             memory_only: false,
@@ -440,6 +445,7 @@ async fn delete_data_with_dataset_if_empty_true_preserves_non_empty_dataset() {
                 data_id: data_id_1,
                 dataset_name: Some("two_item_ds".to_string()),
                 delete_dataset_if_empty: true,
+                tenant_id: None,
             },
             mode: DeleteMode::Soft,
             memory_only: false,

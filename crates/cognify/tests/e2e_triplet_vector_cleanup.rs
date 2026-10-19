@@ -277,6 +277,7 @@ async fn test_triplet_vector_cleanup_after_data_delete() {
                 data_id: data_ai_id,
                 dataset_name: Some("ds_ai".to_string()),
                 delete_dataset_if_empty: false,
+                tenant_id: None,
             },
             mode: DeleteMode::Soft,
             memory_only: false,

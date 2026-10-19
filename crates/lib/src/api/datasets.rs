@@ -958,10 +958,8 @@ mod tests {
     /// (exercises `check_delete_permission` → `has_permission_in_tenant`);
     /// the reader is denied.
     ///
-    /// The caller is made the owner deliberately: `empty_dataset` feeds the
-    /// caller id into `DeleteScope::Dataset { owner_id }`, so the inner
-    /// `DeleteService` resolves the dataset by `(name, caller)` and a
-    /// non-owner would fail *after* the gate with `Validation(not found)`.
+    /// `empty_dataset` deletes by id (`DeleteScope::DatasetById`) once the
+    /// gate passes, so only the gate decides here.
     #[tokio::test]
     async fn acl_delete_grant_via_role_admits_empty_dataset() {
         use cognee_database::DeleteDb;

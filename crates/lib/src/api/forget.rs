@@ -151,8 +151,15 @@ pub struct ForgetResult {
 ///   among the owner's datasets in this tenant (strict, `None` ⇔ tenant-less;
 ///   see [`DatasetRef::resolve`]) and are then deleted **by id**, so a
 ///   same-named dataset in another tenant is never touched.
-///   [`ForgetTarget::All`] is not tenant-scoped yet (owner-wide
-///   `DeleteScope::User`; S2).
+///   [`ForgetTarget::All`] is tenant-scoped too: it deletes the owner's
+///   datasets in this tenant (`DeleteScope::User { owner_id, tenant_id }`),
+///   one after another **by id**, and stops at the first failure with
+///   [`DeleteError::Partial`](cognee_delete::DeleteError::Partial) — Python's
+///   `_forget_everything` → `datasets.delete_all(user)`
+///   (`cognee/api/v1/forget/forget.py:191-205@37f788bd2`,
+///   `cognee/api/v1/datasets/datasets.py:316-323@37f788bd2`). Unlike Python
+///   it does not prune the whole session cache: a global prune from a
+///   per-tenant forget is unsafe in a multi-tenant deployment.
 /// * `delete_service` - Pre-configured [`DeleteService`] with all backends.
 /// * `db` - Database connection for dataset resolution. Required for every
 ///   target that references a dataset (by name or id); unused by
@@ -215,7 +222,10 @@ pub async fn forget(
             (scope, false, format!("dataset:{}", ds.name))
         }
         ForgetTarget::All => {
-            let scope = DeleteScope::User { owner_id };
+            let scope = DeleteScope::User {
+                owner_id,
+                tenant_id,
+            };
             (scope, false, "all".to_string())
         }
         ForgetTarget::DatasetMemoryOnly { dataset } => {

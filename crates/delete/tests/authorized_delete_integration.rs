@@ -144,6 +144,7 @@ async fn acl_denied_returns_permission_denied() {
                     data_id,
                     dataset_name: Some("acl_denied_ds".to_string()),
                     delete_dataset_if_empty: false,
+                    tenant_id: None,
                 },
                 mode: DeleteMode::Soft,
                 memory_only: false,
@@ -201,6 +202,7 @@ async fn acl_granted_allows_deletion() {
                     data_id,
                     dataset_name: Some("acl_granted_ds".to_string()),
                     delete_dataset_if_empty: false,
+                    tenant_id: None,
                 },
                 mode: DeleteMode::Soft,
                 memory_only: false,
@@ -252,6 +254,7 @@ async fn preview_respects_acl() {
                     data_id,
                     dataset_name: Some("preview_acl_ds".to_string()),
                     delete_dataset_if_empty: false,
+                    tenant_id: None,
                 },
                 mode: DeleteMode::Soft,
                 memory_only: false,
@@ -300,6 +303,7 @@ async fn cross_user_isolation() {
                     data_id: data_a_id,
                     dataset_name: Some("user_a_ds".to_string()),
                     delete_dataset_if_empty: false,
+                    tenant_id: None,
                 },
                 mode: DeleteMode::Soft,
                 memory_only: false,
@@ -327,6 +331,7 @@ async fn cross_user_isolation() {
                     data_id: data_b_id,
                     dataset_name: Some("user_b_ds".to_string()),
                     delete_dataset_if_empty: false,
+                    tenant_id: None,
                 },
                 mode: DeleteMode::Soft,
                 memory_only: false,
@@ -552,7 +557,10 @@ async fn user_scope_cover_excludes_grants_in_another_tenant() {
 
     assert_denied(
         svc.execute(
-            &request(DeleteScope::User { owner_id: owner }),
+            &request(DeleteScope::User {
+                owner_id: owner,
+                tenant_id: None,
+            }),
             owner,
             Some(t1),
         )
@@ -575,7 +583,10 @@ async fn user_scope_cover_excludes_grants_in_another_tenant() {
     grant_delete_permission(&acl, owner, b).await;
     let svc = build_authorized_service(&db, &storage, &acl);
     svc.execute(
-        &request(DeleteScope::User { owner_id: owner }),
+        &request(DeleteScope::User {
+            owner_id: owner,
+            tenant_id: None,
+        }),
         owner,
         Some(t1),
     )
@@ -670,7 +681,10 @@ async fn user_scope_denial_does_not_name_the_uncovered_dataset() {
 
     match svc
         .execute(
-            &request(DeleteScope::User { owner_id: owner }),
+            &request(DeleteScope::User {
+                owner_id: owner,
+                tenant_id: None,
+            }),
             owner,
             Some(t1),
         )
@@ -740,6 +754,7 @@ async fn by_name_delete_resolves_and_deletes_only_in_the_callers_tenant() {
             data_id: data_u,
             dataset_name: Some("same".to_string()),
             delete_dataset_if_empty: false,
+            tenant_id: None,
         }),
         owner,
         None,
@@ -767,6 +782,7 @@ async fn by_name_delete_resolves_and_deletes_only_in_the_callers_tenant() {
                 data_id: data_t1,
                 dataset_name: Some("same".to_string()),
                 delete_dataset_if_empty: false,
+                tenant_id: None,
             }),
             owner,
             None,
@@ -787,6 +803,7 @@ async fn by_name_delete_resolves_and_deletes_only_in_the_callers_tenant() {
         &request(DeleteScope::Dataset {
             owner_id: owner,
             dataset_name: "same".to_string(),
+            tenant_id: None,
         }),
         owner,
         None,
@@ -814,6 +831,7 @@ async fn by_name_delete_resolves_and_deletes_only_in_the_callers_tenant() {
             &request(DeleteScope::Dataset {
                 owner_id: owner,
                 dataset_name: "same".to_string(),
+                tenant_id: None,
             }),
             owner,
             None,
@@ -833,6 +851,7 @@ async fn by_name_delete_resolves_and_deletes_only_in_the_callers_tenant() {
         &request(DeleteScope::Dataset {
             owner_id: owner,
             dataset_name: "same".to_string(),
+            tenant_id: None,
         }),
         owner,
         Some(t1),

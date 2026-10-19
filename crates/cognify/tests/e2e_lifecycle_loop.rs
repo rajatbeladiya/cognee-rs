@@ -244,6 +244,7 @@ async fn test_readd_and_recognify_after_delete() {
             scope: DeleteScope::Dataset {
                 owner_id,
                 dataset_name: "lifecycle_test".to_string(),
+                tenant_id: None,
             },
             mode: DeleteMode::Hard,
             memory_only: false,

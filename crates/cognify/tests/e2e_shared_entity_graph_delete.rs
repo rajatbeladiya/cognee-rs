@@ -254,6 +254,7 @@ async fn test_shared_entity_graph_delete() {
             scope: DeleteScope::Dataset {
                 owner_id,
                 dataset_name: "ds_ai".to_string(),
+                tenant_id: None,
             },
             mode: DeleteMode::Hard,
             memory_only: false,

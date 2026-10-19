@@ -453,6 +453,7 @@ async fn test_recognify_after_content_update() {
                 data_id: data_id_v1,
                 dataset_name: Some(dataset_name.to_string()),
                 delete_dataset_if_empty: false,
+                tenant_id: None,
             },
             mode: DeleteMode::Hard,
             memory_only: false,

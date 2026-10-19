@@ -267,6 +267,7 @@ async fn test_search_returns_empty_for_deleted_doc_and_non_empty_for_remaining()
                 data_id: germany_data_id,
                 dataset_name: Some("search_test".to_string()),
                 delete_dataset_if_empty: false,
+                tenant_id: None,
             },
             mode: DeleteMode::Soft,
             memory_only: false,

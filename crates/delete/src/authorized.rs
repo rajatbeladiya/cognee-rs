@@ -106,31 +106,16 @@ impl AuthorizedDeleteService {
         tenant_id: Option<Uuid>,
     ) -> Result<DeleteResult, DeleteError> {
         if matches!(request.scope, DeleteScope::All) {
-            let mut total = DeleteResult::default();
-            let mut done = 0usize;
-            for ds in self.deletable_in_tenant(principal_id, tenant_id).await? {
-                match self.inner.execute(&by_id(request, ds.id)).await {
-                    Ok(r) => {
-                        total += r;
-                        done += 1;
-                    }
-                    Err(e) if done == 0 => return Err(e),
-                    Err(e) => {
-                        tracing::warn!(
-                            principal = %principal_id,
-                            failed_dataset = %ds.id,
-                            completed_datasets = done,
-                            "delete-all stopped at the first failing dataset"
-                        );
-                        return Err(DeleteError::Partial {
-                            completed: Box::new(total),
-                            failed_dataset_id: ds.id,
-                            source: Box::new(e),
-                        });
-                    }
-                }
-            }
-            return Ok(total);
+            let ids: Vec<Uuid> = self
+                .deletable_in_tenant(principal_id, tenant_id)
+                .await?
+                .iter()
+                .map(|ds| ds.id)
+                .collect();
+            return self
+                .inner
+                .execute_datasets_by_id(&ids, request.mode.clone(), request.memory_only)
+                .await;
         }
         let authorized = self.authorize(request, principal_id, tenant_id).await?;
         self.inner.execute(&authorized).await
@@ -170,6 +155,7 @@ impl AuthorizedDeleteService {
                 data_id,
                 dataset_name: Some(ds_name),
                 delete_dataset_if_empty,
+                ..
             } => {
                 let dataset_id = self
                     .resolve_dataset_id(*owner_id, ds_name, tenant_id)
@@ -185,6 +171,7 @@ impl AuthorizedDeleteService {
             DeleteScope::Dataset {
                 owner_id,
                 dataset_name,
+                ..
             } => {
                 let dataset_id = self
                     .resolve_dataset_id(*owner_id, dataset_name, tenant_id)
@@ -253,6 +240,7 @@ impl AuthorizedDeleteService {
             DeleteScope::Dataset {
                 owner_id,
                 dataset_name,
+                ..
             } => {
                 let dataset_id = self
                     .resolve_dataset_id(*owner_id, dataset_name, tenant_id)
@@ -268,7 +256,7 @@ impl AuthorizedDeleteService {
                 self.require_delete_permission(principal_id, tenant_id, *dataset_id)
                     .await?;
             }
-            DeleteScope::User { owner_id } => {
+            DeleteScope::User { owner_id, .. } => {
                 // For user-scoped deletion, verify the principal has delete
                 // on all datasets that would be affected. The inner service
                 // will list all datasets by owner. We check that the
@@ -325,15 +313,6 @@ impl AuthorizedDeleteService {
         }
 
         Ok(())
-    }
-}
-
-/// `request` with its scope replaced by `DatasetById { dataset_id }`.
-fn by_id(request: &DeleteRequest, dataset_id: Uuid) -> DeleteRequest {
-    DeleteRequest {
-        scope: DeleteScope::DatasetById { dataset_id },
-        mode: request.mode.clone(),
-        memory_only: request.memory_only,
     }
 }
 

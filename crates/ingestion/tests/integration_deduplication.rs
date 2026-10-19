@@ -420,6 +420,7 @@ async fn impl_cascade_deletion_preserves_data_with_remaining_links(db_url: &str)
             scope: DeleteScope::Dataset {
                 owner_id: owner,
                 dataset_name: "ds1".to_string(),
+                tenant_id: None,
             },
             mode: DeleteMode::Soft,
             memory_only: false,
@@ -451,6 +452,7 @@ async fn impl_cascade_deletion_preserves_data_with_remaining_links(db_url: &str)
             scope: DeleteScope::Dataset {
                 owner_id: owner,
                 dataset_name: "ds2".to_string(),
+                tenant_id: None,
             },
             mode: DeleteMode::Soft,
             memory_only: false,
@@ -466,6 +468,7 @@ async fn impl_cascade_deletion_preserves_data_with_remaining_links(db_url: &str)
             scope: DeleteScope::Dataset {
                 owner_id: owner,
                 dataset_name: "ds3".to_string(),
+                tenant_id: None,
             },
             mode: DeleteMode::Soft,
             memory_only: false,

@@ -203,14 +203,19 @@ pub async fn build_request_async(
             data_id: parsed_data_id,
             dataset_name: dataset_name_opt,
             delete_dataset_if_empty: args.delete_dataset_if_empty,
+            tenant_id: None,
         }
     } else if let Some(dataset_name) = dataset_name_opt {
         DeleteScope::Dataset {
             owner_id,
             dataset_name,
+            tenant_id: None,
         }
     } else if args.user_id.is_some() {
-        DeleteScope::User { owner_id }
+        DeleteScope::User {
+            owner_id,
+            tenant_id: None,
+        }
     } else {
         DeleteScope::All
     };

@@ -195,6 +195,7 @@ async fn test_delete_preview_counts_match_execution() {
         scope: DeleteScope::Dataset {
             owner_id,
             dataset_name: dataset_name.to_string(),
+            tenant_id: None,
         },
         mode: DeleteMode::Soft,
         memory_only: false,
