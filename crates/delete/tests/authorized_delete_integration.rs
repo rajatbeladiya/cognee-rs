@@ -543,55 +543,81 @@ async fn tenantless_caller_cannot_delete_a_tenanted_dataset_it_holds_delete_on()
     .expect("tenant-less caller on a tenant-less dataset is admitted");
 }
 
+/// `User { owner, T1 }` from T1 is Python's `datasets.delete_all(user)`
+/// (`datasets.py:316-323@37f788bd2`): only the owner's datasets **in T1**
+/// are deleted; the T2 one stays, even though it is granted too. A `User`
+/// scope naming another tenant than the caller's is denied.
 #[tokio::test]
-async fn user_scope_cover_excludes_grants_in_another_tenant() {
+async fn user_scope_is_tenant_scoped_and_leaves_other_tenants_alone() {
     let (db, storage, acl) = setup().await;
     let owner = Uuid::new_v4();
     let t1 = Uuid::new_v4();
     let t2 = Uuid::new_v4();
     let (in_t1, data_t1) = seed_in_tenant(&db, &storage, &acl, owner, "in_t1", Some(t1)).await;
-    let (in_t2, _) = seed_in_tenant(&db, &storage, &acl, owner, "in_t2", Some(t2)).await;
+    let (in_t2, data_t2) = seed_in_tenant(&db, &storage, &acl, owner, "in_t2", Some(t2)).await;
     grant_delete_permission(&acl, owner, in_t1).await;
     grant_delete_permission(&acl, owner, in_t2).await;
     let svc = build_authorized_service(&db, &storage, &acl);
 
+    // The scope's tenant must be the caller's.
     assert_denied(
         svc.execute(
             &request(DeleteScope::User {
                 owner_id: owner,
-                tenant_id: None,
+                tenant_id: Some(t2),
             }),
             owner,
             Some(t1),
         )
         .await,
-        "User scope with an owner dataset in T2",
+        "User scope in T2 requested from T1",
+    );
+    assert!(
+        database::ops::data::get_data(&db, data_t2)
+            .await
+            .unwrap()
+            .is_some(),
+        "a denied request deletes nothing"
+    );
+
+    let result = svc
+        .execute(
+            &request(DeleteScope::User {
+                owner_id: owner,
+                tenant_id: Some(t1),
+            }),
+            owner,
+            Some(t1),
+        )
+        .await
+        .expect("User scope in the caller's tenant is admitted");
+    assert_eq!(result.deleted_datasets, 1);
+    assert!(
+        database::ops::datasets::get_dataset(&db, in_t1)
+            .await
+            .unwrap()
+            .is_none(),
+        "the T1 dataset is deleted"
     );
     assert!(
         database::ops::data::get_data(&db, data_t1)
             .await
             .unwrap()
-            .is_some(),
-        "nothing is deleted when the cover fails"
+            .is_none()
     );
-
-    // Same fixture with every owner dataset in T1: the cover holds.
-    let (db, storage, acl) = setup().await;
-    let (a, _) = seed_in_tenant(&db, &storage, &acl, owner, "a", Some(t1)).await;
-    let (b, _) = seed_in_tenant(&db, &storage, &acl, owner, "b", Some(t1)).await;
-    grant_delete_permission(&acl, owner, a).await;
-    grant_delete_permission(&acl, owner, b).await;
-    let svc = build_authorized_service(&db, &storage, &acl);
-    svc.execute(
-        &request(DeleteScope::User {
-            owner_id: owner,
-            tenant_id: None,
-        }),
-        owner,
-        Some(t1),
-    )
-    .await
-    .expect("User scope with every owner dataset in the caller's tenant is admitted");
+    assert!(
+        database::ops::datasets::get_dataset(&db, in_t2)
+            .await
+            .unwrap()
+            .is_some(),
+        "the T2 dataset is left alone"
+    );
+    assert!(
+        database::ops::data::get_data(&db, data_t2)
+            .await
+            .unwrap()
+            .is_some()
+    );
 }
 
 /// `DeleteScope::All` is Python's `datasets.delete_all`
@@ -846,12 +872,13 @@ async fn by_name_delete_resolves_and_deletes_only_in_the_callers_tenant() {
             .is_some()
     );
 
-    // In T1 the name resolves to the T1 row.
+    // In T1 (the scope names the caller's tenant) the name resolves to the
+    // T1 row.
     svc.execute(
         &request(DeleteScope::Dataset {
             owner_id: owner,
             dataset_name: "same".to_string(),
-            tenant_id: None,
+            tenant_id: Some(t1),
         }),
         owner,
         Some(t1),
