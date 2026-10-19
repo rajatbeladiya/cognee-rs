@@ -1544,9 +1544,12 @@ count only grants on datasets in the caller's tenant (`delete_all` uses the
 `AuthorizedDeleteService`'s `DeleteScope::All` deletes the caller's
 `delete`-authorized datasets in its tenant, like Python's `datasets.delete_all`.
 
-Without an ACL, the `DatasetManager` per-id methods (`list_data`, `has_data`,
-`empty_dataset`, `delete_data`) perform no ownership or tenant check — the
-tenant they take is used only under an ACL.
+Without an ACL, `DatasetManager::empty_dataset` / `delete_data` require the
+dataset to be the caller's and in its tenant, then delete by id; `list_data` /
+`has_data` perform no ownership or tenant check — the tenant they take is used
+only under an ACL. Every by-name dataset lookup on these paths (`update`,
+`AuthorizedDeleteService`, search names, `forget`) resolves among the owner's
+datasets in the caller's tenant, strictly, and the delete then runs by id.
 
 Without an `AclDb`, an unfiltered search stays unscoped and every type runs, as
 in Python's non-ACL mode. The ownership fallback that replaces the ACL — explicit

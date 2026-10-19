@@ -36,6 +36,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   | `AuthorizedDeleteService` User-cover denial message | names the uncovered dataset | generic (`delete permission denied for the requested scope`) |
   | `DatasetManager::delete_all` | lists `read`-authorized (ACL) / owned datasets and deletes each **by name** | lists `delete`-authorized in tenant (ACL) / owned in tenant, deletes each **by id** |
   | `cognee-cli search` / `recall` | no tenant | new `--tenant-id` (strict match) |
+  | `IngestDb` / `DeleteDb` | — | new provided `get_dataset_by_name_in_tenant` (strict, `None` ⇔ NULL; point query on SeaORM) and `get_datasets_by_ids` (batch on SeaORM) |
+  | `cognee_database::ops::acl::authorized_datasets_in_tenant` | — | new: existing datasets a user holds a permission on in a tenant (one ACL listing + one batch lookup) |
+  | `AuthorizedDeleteService` by-name scopes (`Dataset`, `Data` with a name) | resolved with no tenant predicate, inner service re-resolved by name | resolved once in the caller's tenant (strict), inner service driven **by id** |
+  | `AuthorizedDeleteService` `DeleteScope::All` failure | first error, progress lost | `DeleteError::Partial { completed, failed_dataset_id, source }` after the first dataset |
+  | `AuthorizedDeleteService::preview(All)` | sum of per-dataset previews | union preview (`DeleteService::preview_datasets_by_id`, new) |
+  | `DeleteError` | — | new variant `Partial` (exhaustive matches break) |
+  | `DeleteResult` / `DeletePreview` | — | `AddAssign` (field-wise sum) |
+  | `DatasetManager::{empty_dataset, delete_data}` without an ACL | by name (tenant-loose re-resolution) | owner + strict-tenant check, then by id |
+  | `cognee::api::update` delete step | `DeleteScope::Data` by name | `DeleteScope::DataInDataset` by the authorized `dataset_id` |
+  | `cognee::api::forget(target, owner_id, …)` | no tenant; names by owner only | `forget(target, owner_id, tenant_id, …)`; references resolve in the tenant (strict) and delete by id; `db` required for any dataset reference |
+  | `cognee-cli forget --tenant-id` | parsed and ignored | honoured |
   | `cognee::api::update` denial | `ApiError::InvalidArgument` | new `ApiError::PermissionDenied(String)` |
   | `SearchOrchestrator` without an ACL, `tenant_id: None` | no tenant filter for ids and names | tenant-less datasets only |
   | Bindings `list_datasets` / `delete_all_datasets` | every owned dataset | tenant-less datasets only (the handle user has no tenant) |
