@@ -63,6 +63,9 @@ impl IngestDb for DefaultsOnly<'_> {
     async fn create_data(&self, d: Data) -> Result<Data, DatabaseError> {
         IngestDb::create_data(self.0, d).await
     }
+    async fn update_data(&self, d: Data) -> Result<Data, DatabaseError> {
+        IngestDb::update_data(self.0, d).await
+    }
     async fn attach_data_to_dataset(
         &self,
         dataset_id: Uuid,
