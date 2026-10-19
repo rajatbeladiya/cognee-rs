@@ -241,7 +241,7 @@ async fn same_content_different_tenants_separate_data_pg() {
 }
 
 // ---------------------------------------------------------------------------
-// S2 (SDK-936) — a tenant-less add never attaches to a tenanted same-named
+// SDK-936 — a tenant-less add never attaches to a tenanted same-named
 // dataset. Python resolves the add's dataset with
 // `create_dataset.py:16-22@37f788bd2` (`Dataset.tenant_id == user.tenant_id`),
 // so a tenant-less caller gets its own tenant-less row.

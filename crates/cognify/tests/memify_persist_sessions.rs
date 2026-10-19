@@ -213,7 +213,7 @@ async fn persist_tags_nodes_with_user_sessions_node_set() {
     );
 }
 
-/// S2 (SDK-936): a tenant-less persist never touches a tenanted dataset of
+/// SDK-936: a tenant-less persist never touches a tenanted dataset of
 /// the same name. The add and the follow-up lookup both resolve the name with
 /// strict tenant equality (`get_dataset_ids.py:29-34@37f788bd2`,
 /// `create_dataset.py:16-22@37f788bd2`). The tenanted row is seeded **first**

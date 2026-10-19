@@ -281,10 +281,9 @@ impl DatasetManager {
     /// - **no ACL**: the owner's datasets whose tenant equals `tenant_id`
     ///   (strict, as in [`Self::list_datasets`]).
     ///
-    /// Each listed dataset is deleted **by id** (`DeleteScope::DatasetById`),
-    /// never re-resolved by name: a by-name lookup is not tenant-scoped and,
-    /// with two same-named rows in different tenants, could hit the one the
-    /// strict listing excluded.
+    /// Each listed dataset is deleted **by id** (`DeleteScope::DatasetById`):
+    /// under an ACL the listed datasets may belong to other owners, whose
+    /// names the caller's own by-name lookup would not resolve.
     pub async fn delete_all(
         &self,
         owner_id: Uuid,

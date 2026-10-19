@@ -575,7 +575,7 @@ async fn forget_by_dataset_uuid_missing_returns_err() {
 // ---------------------------------------------------------------------------
 // forget() resolves dataset references in the caller's tenant (strict,
 // `None` ⇔ tenant-less; Python `get_dataset_ids.py:30-34@37f788bd2`) and
-// deletes by id — S1 review loop 2.
+// deletes by id.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]

@@ -3,7 +3,7 @@
     clippy::expect_used,
     reason = "test code — panics are acceptable failures"
 )]
-//! S2 delete-parity matrix (SDK-936), library half: `DatasetManager` with and
+//! Delete-parity matrix (SDK-936), library half: `DatasetManager` with and
 //! without an ACL, and `forget`, × {grant (G), no grant (N), grant only in
 //! another tenant (X), no ACL (A)}.
 //!
@@ -203,7 +203,7 @@ fn assert_not_found<T: std::fmt::Debug>(result: Result<T, DatasetError>, what: &
 }
 
 // ---------------------------------------------------------------------------
-// E7a empty_dataset
+// empty_dataset
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -265,7 +265,7 @@ async fn manager_empty_dataset_without_acl_requires_owner_and_tenant() {
 }
 
 // ---------------------------------------------------------------------------
-// E7b delete_data
+// delete_data
 // ---------------------------------------------------------------------------
 
 async fn delete_item(
@@ -338,7 +338,7 @@ async fn manager_delete_data_without_acl_requires_owner_and_tenant() {
 }
 
 // ---------------------------------------------------------------------------
-// E7c delete_all
+// delete_all
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -402,7 +402,7 @@ async fn manager_delete_all_without_acl_is_owner_and_tenant() {
 }
 
 // ---------------------------------------------------------------------------
-// E7d list_data / has_data (D-S2-8)
+// list_data / has_data
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -458,7 +458,7 @@ async fn manager_reads_without_acl_require_owner_and_tenant() {
 }
 
 // ---------------------------------------------------------------------------
-// E8 forget (no ACL by construction: the A column)
+// forget (no ACL by construction: the A column)
 // ---------------------------------------------------------------------------
 
 #[tokio::test]

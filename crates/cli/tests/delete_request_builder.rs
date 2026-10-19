@@ -3,7 +3,7 @@
     clippy::expect_used,
     reason = "test code — panics are acceptable failures"
 )]
-//! E9 of the S2 delete-parity matrix (SDK-936): the CLI delete request
+//! Delete-parity matrix (SDK-936), CLI part: the delete request
 //! builder, run against the service it is built for.
 //!
 //! - `RequestAuthorization::Grant` (the cloud `delete --enforce-acl`): a
