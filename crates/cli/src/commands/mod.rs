@@ -34,6 +34,19 @@ use cognee::{ComponentManager, PipelineContext};
 
 use crate::error::CliError;
 
+/// Parse an optional `--tenant-id` flag.
+///
+/// The tenant is applied by strict equality on read (search/recall): data
+/// written with `--tenant-id T` is reachable only from a read that passes the
+/// same `--tenant-id T`, and a read without the flag reaches only tenant-less
+/// data (Python `get_dataset_ids.py:34`,
+/// `get_all_user_permission_datasets.py:49-53` @37f788bd2).
+pub fn parse_tenant_id(raw: Option<&str>) -> Result<Option<uuid::Uuid>, CliError> {
+    raw.map(uuid::Uuid::parse_str)
+        .transpose()
+        .map_err(|error| CliError::Validation(format!("Invalid --tenant-id: {error}")))
+}
+
 /// Build the `DeleteService` shared by every deletion path in the CLI.
 ///
 /// `delete`, `forget` and the `bench` dataset-delete phase must wire the same
