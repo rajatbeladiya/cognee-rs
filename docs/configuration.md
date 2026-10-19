@@ -1575,16 +1575,17 @@ Deletes in more detail (SDK-936, Python @37f788bd2):
   datasets in that tenant only (`get_dataset_ids.py:29-34`).
 - `DeleteScope::User` and `forget(ForgetTarget::All)` delete those datasets one
   after another **by id** and stop at the first failure: the datasets before it
-  stay deleted and are reported in `DeleteError::Partial`; the owner's search
-  history is cleared only once all are gone (`datasets.py:316-323`,
-  `forget.py:191-205`). Unlike Python, `forget(All)` does not prune the whole
+  stay deleted and are reported in `DeleteError::Partial`. Like Python they do
+  not delete search history (`datasets.py:316-323`, `forget.py:191-221`); the
+  history table has no tenant, so a per-tenant delete could not scope it. Unlike Python, `forget(All)` does not prune the whole
   session cache. `DeleteService::execute_datasets_by_id` is the shared
   implementation.
 - Under an ACL (`AuthorizedDeleteService`), an owner-scoped scope whose
   `tenant_id` is not the caller's tenant is denied, and a data item without its
   dataset (`Data { dataset_name: None }`) is refused with a validation error —
   Python has no dataset-less item delete (`datasets.py:218-224`,
-  `forget.py:161-162`). A grant reaches another user's dataset only by id.
+  `forget.py:161-162`). A grant reaches another user's dataset only by id: a
+  by-name scope whose owner is not the caller is denied before any lookup.
 - A data item with no `Data` row inside an empty dataset deletes that dataset
   when `delete_dataset_if_empty` is set (`datasets.py:259-273`).
 - `cognee-cli delete --all` without an ACL deletes the caller's datasets in its
