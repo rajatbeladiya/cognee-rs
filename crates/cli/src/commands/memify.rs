@@ -60,7 +60,7 @@ pub fn run(args: MemifyArgs, cm: Arc<ComponentManager>) -> Result<(), CliError> 
         let mut total_batches = 0usize;
 
         for dataset_name in &dataset_names {
-            let dataset = cognee::database::IngestDb::get_dataset_by_name(
+            let dataset = cognee::database::IngestDb::get_dataset_by_name_in_tenant(
                 &*database,
                 dataset_name,
                 owner_id,

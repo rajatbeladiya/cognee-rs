@@ -901,15 +901,6 @@ impl DeleteDb for FailingDeleteOf {
         DeleteDb::list_datasets_for_data(self.inner.as_ref(), data_id).await
     }
 
-    async fn get_dataset_by_name(
-        &self,
-        name: &str,
-        owner_id: Uuid,
-        tenant_id: Option<Uuid>,
-    ) -> Result<Option<Dataset>, DatabaseError> {
-        DeleteDb::get_dataset_by_name(self.inner.as_ref(), name, owner_id, tenant_id).await
-    }
-
     async fn get_dataset_data(&self, dataset_id: Uuid) -> Result<Vec<Data>, DatabaseError> {
         DeleteDb::get_dataset_data(self.inner.as_ref(), dataset_id).await
     }

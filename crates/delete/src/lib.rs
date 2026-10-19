@@ -1661,7 +1661,7 @@ impl DeleteService {
         if let Some(dataset_name) = dataset_name {
             let dataset = self
                 .database
-                .get_dataset_by_name(dataset_name, owner_id, None)
+                .get_dataset_by_name_in_tenant(dataset_name, owner_id, None)
                 .await
                 .map_err(|error| {
                     DeleteError::Runtime(format!(
@@ -1831,7 +1831,7 @@ impl DeleteService {
     ) -> Result<ResolvedDeleteTargets, DeleteError> {
         let dataset = self
             .database
-            .get_dataset_by_name(dataset_name, owner_id, None)
+            .get_dataset_by_name_in_tenant(dataset_name, owner_id, None)
             .await
             .map_err(|error| {
                 DeleteError::Runtime(format!(
@@ -2322,10 +2322,14 @@ mod tests {
         assert_eq!(result.deleted_datasets, 1);
         assert_eq!(result.deleted_data, 1);
 
-        let still_exists =
-            cognee_database::IngestDb::get_dataset_by_name(&*db, "test_dataset", owner, None)
-                .await
-                .unwrap();
+        let still_exists = cognee_database::IngestDb::get_dataset_by_name_in_tenant(
+            &*db,
+            "test_dataset",
+            owner,
+            None,
+        )
+        .await
+        .unwrap();
         assert!(still_exists.is_none(), "dataset should be gone");
     }
 
@@ -2349,10 +2353,14 @@ mod tests {
         assert_eq!(preview.datasets_to_delete, 1);
         assert_eq!(preview.data_to_delete, 1);
 
-        let still_exists =
-            cognee_database::IngestDb::get_dataset_by_name(&*db, "test_dataset", owner, None)
-                .await
-                .unwrap();
+        let still_exists = cognee_database::IngestDb::get_dataset_by_name_in_tenant(
+            &*db,
+            "test_dataset",
+            owner,
+            None,
+        )
+        .await
+        .unwrap();
         assert!(
             still_exists.is_some(),
             "dataset should still exist after preview"
@@ -5556,9 +5564,14 @@ mod tests {
         );
 
         // Verify the dataset is actually gone from the DB
-        let ds = cognee_database::IngestDb::get_dataset_by_name(&*db, "auto_del_ds", owner, None)
-            .await
-            .unwrap();
+        let ds = cognee_database::IngestDb::get_dataset_by_name_in_tenant(
+            &*db,
+            "auto_del_ds",
+            owner,
+            None,
+        )
+        .await
+        .unwrap();
         assert!(ds.is_none(), "dataset should be gone from DB");
     }
 
@@ -5630,9 +5643,14 @@ mod tests {
         );
 
         // Verify the dataset still exists
-        let ds = cognee_database::IngestDb::get_dataset_by_name(&*db, "multi_data_ds", owner, None)
-            .await
-            .unwrap();
+        let ds = cognee_database::IngestDb::get_dataset_by_name_in_tenant(
+            &*db,
+            "multi_data_ds",
+            owner,
+            None,
+        )
+        .await
+        .unwrap();
         assert!(ds.is_some(), "dataset should still exist in DB");
     }
 
@@ -5664,9 +5682,14 @@ mod tests {
         );
 
         // Verify the dataset still exists (even though it's now empty)
-        let ds = cognee_database::IngestDb::get_dataset_by_name(&*db, "no_flag_ds", owner, None)
-            .await
-            .unwrap();
+        let ds = cognee_database::IngestDb::get_dataset_by_name_in_tenant(
+            &*db,
+            "no_flag_ds",
+            owner,
+            None,
+        )
+        .await
+        .unwrap();
         assert!(
             ds.is_some(),
             "dataset should still exist despite being empty"
@@ -5674,11 +5697,11 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // tenant_id filtering in DeleteDb::get_dataset_by_name
+    // DeleteDb::get_dataset_by_name_in_tenant is tenant-strict
     // ------------------------------------------------------------------
 
     #[tokio::test]
-    async fn delete_db_get_dataset_by_name_filters_by_tenant_id() {
+    async fn delete_db_by_name_lookup_is_tenant_strict() {
         use cognee_database::DeleteDb;
 
         let db = cognee_database::connect("sqlite::memory:").await.unwrap();
@@ -5708,16 +5731,20 @@ mod tests {
             .await
             .unwrap();
 
-        // Without tenant_id (None), the query returns one of them (ambiguous).
-        let any = db
-            .get_dataset_by_name("shared_name", owner, None)
+        // `None` matches only a tenant-less row: with only tenanted rows it
+        // finds nothing (strict, `get_dataset_ids.py:34@37f788bd2`).
+        let none_yet = db
+            .get_dataset_by_name_in_tenant("shared_name", owner, None)
             .await
             .unwrap();
-        assert!(any.is_some(), "should find at least one dataset");
+        assert!(
+            none_yet.is_none(),
+            "a tenant-less lookup must not return a tenanted row"
+        );
 
         // With tenant_a, only the first dataset is returned.
         let found_a = db
-            .get_dataset_by_name("shared_name", owner, Some(tenant_a))
+            .get_dataset_by_name_in_tenant("shared_name", owner, Some(tenant_a))
             .await
             .unwrap();
         assert_eq!(
@@ -5728,7 +5755,7 @@ mod tests {
 
         // With tenant_b, only the second dataset is returned.
         let found_b = db
-            .get_dataset_by_name("shared_name", owner, Some(tenant_b))
+            .get_dataset_by_name_in_tenant("shared_name", owner, Some(tenant_b))
             .await
             .unwrap();
         assert_eq!(
@@ -5739,12 +5766,27 @@ mod tests {
 
         // With a nonexistent tenant_id, nothing is returned.
         let found_none = db
-            .get_dataset_by_name("shared_name", owner, Some(Uuid::new_v4()))
+            .get_dataset_by_name_in_tenant("shared_name", owner, Some(Uuid::new_v4()))
             .await
             .unwrap();
         assert!(
             found_none.is_none(),
             "should find no dataset for unknown tenant"
+        );
+
+        // Add a tenant-less row: `None` now finds exactly it.
+        let ds_none = Dataset::new("shared_name".to_string(), owner, None, Uuid::new_v4());
+        ops::datasets::create_dataset(&db, ds_none.clone())
+            .await
+            .unwrap();
+        let found_tenantless = db
+            .get_dataset_by_name_in_tenant("shared_name", owner, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            found_tenantless.map(|d| d.id),
+            Some(ds_none.id),
+            "`None` must resolve exactly the tenant-less row"
         );
     }
 
@@ -5840,10 +5882,14 @@ mod tests {
         );
 
         // Dataset row still exists in the DB.
-        let ds_still =
-            cognee_database::IngestDb::get_dataset_by_name(&*db, "memory_only_ds", owner, None)
-                .await
-                .unwrap();
+        let ds_still = cognee_database::IngestDb::get_dataset_by_name_in_tenant(
+            &*db,
+            "memory_only_ds",
+            owner,
+            None,
+        )
+        .await
+        .unwrap();
         assert!(
             ds_still.is_some(),
             "Dataset row must survive memory-only forget"
@@ -5967,7 +6013,7 @@ mod tests {
         );
 
         // Dataset row still exists.
-        let ds_still = cognee_database::IngestDb::get_dataset_by_name(
+        let ds_still = cognee_database::IngestDb::get_dataset_by_name_in_tenant(
             &*db,
             "memory_only_item_ds",
             owner,

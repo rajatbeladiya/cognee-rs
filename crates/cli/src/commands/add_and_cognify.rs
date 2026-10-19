@@ -107,7 +107,7 @@ pub fn run(args: AddAndCognifyArgs, cm: Arc<ComponentManager>) -> Result<(), Cli
         }
 
         // ── Cognify only the newly-added items ──────────────────────────────
-        let dataset = cognee::database::IngestDb::get_dataset_by_name(
+        let dataset = cognee::database::IngestDb::get_dataset_by_name_in_tenant(
             &*database,
             &dataset_name,
             owner_id,

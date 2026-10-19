@@ -310,7 +310,7 @@ async fn delete_data_with_dataset_if_empty_false_preserves_dataset() {
         result.deleted_datasets, 0,
         "dataset should NOT be deleted when delete_dataset_if_empty is false"
     );
-    let ds = ops::datasets::get_dataset_by_name(&db, "keep_ds", owner_id, None)
+    let ds = ops::datasets::get_dataset_by_name_in_tenant(&db, "keep_ds", owner_id, None)
         .await
         .unwrap();
     assert!(
@@ -373,7 +373,7 @@ async fn delete_data_with_dataset_if_empty_true_removes_dataset() {
         result.deleted_datasets >= 1,
         "dataset should be deleted when delete_dataset_if_empty is true and dataset is empty"
     );
-    let ds = ops::datasets::get_dataset_by_name(&db, "remove_ds", owner_id, None)
+    let ds = ops::datasets::get_dataset_by_name_in_tenant(&db, "remove_ds", owner_id, None)
         .await
         .unwrap();
     assert!(
@@ -457,7 +457,7 @@ async fn delete_data_with_dataset_if_empty_true_preserves_non_empty_dataset() {
         result.deleted_datasets, 0,
         "dataset should NOT be deleted because it still has data"
     );
-    let ds = ops::datasets::get_dataset_by_name(&db, "two_item_ds", owner_id, None)
+    let ds = ops::datasets::get_dataset_by_name_in_tenant(&db, "two_item_ds", owner_id, None)
         .await
         .unwrap();
     assert!(

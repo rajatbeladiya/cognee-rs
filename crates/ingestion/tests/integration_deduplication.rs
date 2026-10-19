@@ -102,11 +102,11 @@ async fn impl_file_deduplication_same_content_yields_one_record(db_url: &str) {
         .len();
     assert_eq!(all_data_count, 2, "should have 2 datasets");
 
-    let ds1 = ops::datasets::get_dataset_by_name(&database, "dataset1", owner, None)
+    let ds1 = ops::datasets::get_dataset_by_name_in_tenant(&database, "dataset1", owner, None)
         .await
         .expect("get ds1")
         .expect("ds1 should exist");
-    let ds2 = ops::datasets::get_dataset_by_name(&database, "dataset2", owner, None)
+    let ds2 = ops::datasets::get_dataset_by_name_in_tenant(&database, "dataset2", owner, None)
         .await
         .expect("get ds2")
         .expect("ds2 should exist");
@@ -179,11 +179,11 @@ async fn impl_text_deduplication_across_two_calls(db_url: &str) {
     );
     assert_eq!(result1[0].name, result2[0].name, "same content → same name");
 
-    let ds1 = ops::datasets::get_dataset_by_name(&database, "dataset1", owner, None)
+    let ds1 = ops::datasets::get_dataset_by_name_in_tenant(&database, "dataset1", owner, None)
         .await
         .unwrap()
         .unwrap();
-    let ds2 = ops::datasets::get_dataset_by_name(&database, "dataset2", owner, None)
+    let ds2 = ops::datasets::get_dataset_by_name_in_tenant(&database, "dataset2", owner, None)
         .await
         .unwrap()
         .unwrap();

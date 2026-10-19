@@ -107,10 +107,11 @@ async fn test_delete_preview_counts_match_execution() {
         .with_summarization(false)
         .with_triplet_embeddings(false);
 
-    let dataset = ops::datasets::get_dataset_by_name(&database, dataset_name, owner_id, None)
-        .await
-        .expect("get_dataset_by_name")
-        .expect("dataset should exist after ingest");
+    let dataset =
+        ops::datasets::get_dataset_by_name_in_tenant(&database, dataset_name, owner_id, None)
+            .await
+            .expect("get_dataset_by_name_in_tenant")
+            .expect("dataset should exist after ingest");
 
     let cognify_result = match cognify(
         data_items,

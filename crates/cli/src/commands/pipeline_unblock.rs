@@ -63,7 +63,7 @@ pub fn run(args: PipelineUnblockArgs, cm: Arc<ComponentManager>) -> Result<(), C
             .await
             .map_err(|e| CliError::Runtime(format!("{e}")))?;
 
-        let dataset = cognee::database::IngestDb::get_dataset_by_name(
+        let dataset = cognee::database::IngestDb::get_dataset_by_name_in_tenant(
             &*database,
             &args.dataset,
             owner_id,
