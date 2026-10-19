@@ -28,15 +28,30 @@ pub use cognee_database::DatasetDb;
 /// Wraps the low-level DB traits with optional ACL enforcement, matching
 /// the Python SDK's `datasets` class.
 ///
-/// Every caller-facing method takes the caller's `tenant_id` next to
-/// `owner_id`. It is applied with **strict equality** (`None` admits only
+/// The caller-facing methods take the caller's `tenant_id` next to
+/// `owner_id`; it must be the caller's own (authenticated) tenant. Where it is
+/// applied, it is applied with **strict equality** (`None` admits only
 /// datasets that have no tenant), like Python's
 /// `dataset.tenant_id == user.tenant_id`
-/// (`cognee/modules/users/permissions/methods/get_all_user_permission_datasets.py:49-53@37f788bd2`).
+/// (`cognee/modules/users/permissions/methods/get_all_user_permission_datasets.py:49-53@37f788bd2`):
+/// - [`Self::list_datasets`] and [`Self::delete_all`] apply it on **both**
+///   paths (ACL and ownership fallback);
+/// - the per-id methods ([`Self::list_data`], [`Self::has_data`],
+///   [`Self::empty_dataset`], [`Self::delete_data`]) apply it **only under an
+///   ACL**. Without an ACL they perform no ownership or tenant check at all
+///   (`tenant_id` is ignored) — a known gap left to S2/S3.
+///
 /// Under an ACL, "no grant", "a grant only in another tenant" and "unknown
-/// id" all answer [`DatasetError::PermissionDenied`], as Python's single
-/// `PermissionDeniedError` does
-/// (`get_specific_user_permission_datasets.py:27-38@37f788bd2`).
+/// id" all answer [`DatasetError::PermissionDenied`] — within each method
+/// Python also answers one error for all three
+/// (`get_specific_user_permission_datasets.py:27-38@37f788bd2`). Python's
+/// HTTP status differs per method: `list_data` / `has_data` / `empty_dataset`
+/// let `PermissionDeniedError` (403,
+/// `cognee/modules/users/exceptions/exceptions.py:42-51`) propagate, while
+/// `delete_data` re-raises it as `UnauthorizedDataAccessError` (**401**,
+/// `cognee/api/v1/datasets/datasets.py:234-240`,
+/// `cognee/modules/data/exceptions/exceptions.py:19-26` @37f788bd2). The
+/// mapping to a status is the HTTP layer's choice.
 pub struct DatasetManager {
     db: Arc<dyn DatasetDb>,
     acl_db: Option<Arc<dyn AclDb>>,
@@ -228,7 +243,8 @@ impl DatasetManager {
     /// Delegates to `DeleteService` with `DeleteScope::Data`.
     ///
     /// Under an ACL, `delete` in `tenant_id` is checked **before** the dataset
-    /// is looked up (Python `delete_data`, `datasets.py:234-240@37f788bd2`).
+    /// is looked up (Python `delete_data`, `datasets.py:234-240@37f788bd2`,
+    /// which answers that denial as `UnauthorizedDataAccessError`, HTTP 401).
     #[allow(
         clippy::too_many_arguments,
         reason = "mirrors Python `delete_data`; the caller tenant is per call like `owner_id`"
@@ -271,24 +287,45 @@ impl DatasetManager {
         Ok(delete_service.execute(&request).await?)
     }
 
-    /// Delete all datasets for an owner.
+    /// Delete every dataset the caller may delete in `tenant_id`.
     ///
-    /// Lists all accessible datasets in `tenant_id` (see
-    /// [`Self::list_datasets`]) and delegates each to `DeleteService`.
+    /// Python `datasets.delete_all` enumerates
+    /// `get_authorized_existing_datasets([], "delete", user)` — the
+    /// `delete`-authorized datasets in the caller's tenant — and empties each
+    /// by id (`cognee/api/v1/datasets/datasets.py:316-323@37f788bd2`). Here:
+    /// - **ACL wired**: the datasets `authorized_dataset_ids_in_tenant(owner_id,
+    ///   "delete", tenant_id)` names (a `read`-only grant is never deleted);
+    /// - **no ACL**: the owner's datasets whose tenant equals `tenant_id`
+    ///   (strict, as in [`Self::list_datasets`]).
+    ///
+    /// Each listed dataset is deleted **by id** (`DeleteScope::DatasetById`),
+    /// never re-resolved by name: a by-name lookup is not tenant-scoped and,
+    /// with two same-named rows in different tenants, could hit the one the
+    /// strict listing excluded.
     pub async fn delete_all(
         &self,
         owner_id: Uuid,
         tenant_id: Option<Uuid>,
         delete_service: &DeleteService,
     ) -> Result<Vec<DeleteResult>, DatasetError> {
-        let datasets = self.list_datasets(owner_id, tenant_id).await?;
+        let datasets = if let Some(acl) = &self.acl_db {
+            let ids = acl
+                .authorized_dataset_ids_in_tenant(owner_id, "delete", tenant_id)
+                .await?;
+            let mut datasets = Vec::with_capacity(ids.len());
+            for id in ids {
+                if let Some(ds) = self.db.get_dataset(id).await? {
+                    datasets.push(ds);
+                }
+            }
+            datasets
+        } else {
+            self.list_datasets(owner_id, tenant_id).await?
+        };
         let mut results = Vec::with_capacity(datasets.len());
         for ds in datasets {
             let request = DeleteRequest {
-                scope: DeleteScope::Dataset {
-                    owner_id,
-                    dataset_name: ds.name,
-                },
+                scope: DeleteScope::DatasetById { dataset_id: ds.id },
                 mode: DeleteMode::Hard,
                 memory_only: false,
             };
@@ -1342,6 +1379,79 @@ mod tests {
         assert_eq!(
             ids(mgr.list_datasets(owner, Some(t1)).await.unwrap()),
             vec![in_t1.id]
+        );
+    }
+
+    /// R1 regression. Scenario: no ACL; the owner has `"x"` in T1 (seeded
+    /// **first**, so an unordered by-name lookup tends to return it) and a
+    /// tenant-less `"x"`. A tenant-less `delete_all` lists only the
+    /// tenant-less row. Expected: that row is deleted and the T1 row survives
+    /// — the listed id is deleted, not re-resolved by name.
+    #[tokio::test]
+    async fn delete_all_deletes_the_listed_dataset_by_id_not_a_same_named_row() {
+        use cognee_database::DeleteDb;
+        let db = fresh_db().await;
+        let owner = Uuid::new_v4();
+        let t1 = Uuid::new_v4();
+        let mgr = DatasetManager::new(db.clone() as Arc<dyn DatasetDb>);
+        let tenanted = mgr.create_dataset("x", owner, Some(t1)).await.unwrap();
+        let untenanted = mgr.create_dataset("x", owner, None).await.unwrap();
+        assert_ne!(tenanted.id, untenanted.id);
+        let delete_service = DeleteService::new(
+            Arc::new(cognee_storage::MockStorage::new()) as Arc<dyn cognee_storage::StorageTrait>,
+            db.clone() as Arc<dyn DeleteDb>,
+        );
+
+        let results = mgr.delete_all(owner, None, &delete_service).await.unwrap();
+        assert_eq!(results.len(), 1);
+        let ingest: &dyn IngestDb = db.as_ref();
+        assert!(
+            ingest.get_dataset(untenanted.id).await.unwrap().is_none(),
+            "the listed tenant-less dataset is deleted"
+        );
+        assert!(
+            ingest.get_dataset(tenanted.id).await.unwrap().is_some(),
+            "the T1 dataset with the same name must survive a tenant-less delete_all"
+        );
+    }
+
+    /// Under an ACL, `delete_all` enumerates `delete`-authorized datasets in
+    /// the caller's tenant (Python `datasets.py:316-323@37f788bd2`): a
+    /// `read`-only grant and a `delete` grant in another tenant are left alone.
+    #[tokio::test]
+    async fn acl_delete_all_deletes_only_delete_authorized_datasets_in_the_callers_tenant() {
+        let (db, acl, mgr, delete_service) = tenant_fixture().await;
+        let caller = Uuid::new_v4();
+        let other_owner = Uuid::new_v4();
+        let t1 = Uuid::new_v4();
+        let t2 = Uuid::new_v4();
+        let (read_only, _) = seed_tenant_dataset(&db, &acl, other_owner, Some(t1)).await;
+        let (deletable, _) = seed_tenant_dataset(&db, &acl, other_owner, Some(t1)).await;
+        let (other_tenant, _) = seed_tenant_dataset(&db, &acl, other_owner, Some(t2)).await;
+        acl.grant_permission(caller, read_only.id, "read")
+            .await
+            .unwrap();
+        acl.grant_permission(caller, deletable.id, "delete")
+            .await
+            .unwrap();
+        acl.grant_permission(caller, other_tenant.id, "delete")
+            .await
+            .unwrap();
+
+        let results = mgr
+            .delete_all(caller, Some(t1), &delete_service)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        let ingest: &dyn IngestDb = db.as_ref();
+        assert!(ingest.get_dataset(deletable.id).await.unwrap().is_none());
+        assert!(
+            ingest.get_dataset(read_only.id).await.unwrap().is_some(),
+            "a read-only grant must not be deleted"
+        );
+        assert!(
+            ingest.get_dataset(other_tenant.id).await.unwrap().is_some(),
+            "a delete grant in T2 must not be used from T1"
         );
     }
 }
