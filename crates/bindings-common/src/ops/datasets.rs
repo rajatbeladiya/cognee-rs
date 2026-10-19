@@ -77,7 +77,9 @@ pub async fn list_data(
 /// Check whether a dataset has any data.
 ///
 /// `dataset_id_str` is a UUID string. Returns a JSON bool (`true` / `false`).
-/// A non-existent dataset UUID returns `false` (COUNT=0, no error).
+/// The read is authorized like Python's `datasets.has_data`: a UUID that is
+/// not one of the handle user's datasets in its tenant (unknown, foreign or
+/// other-tenant) is an error, not `false`.
 pub async fn has_data(
     state: &HandleState,
     dataset_id_str: &str,
@@ -85,8 +87,7 @@ pub async fn has_data(
     let dataset_id = match Uuid::parse_str(dataset_id_str) {
         Ok(id) => id,
         // An unparseable id can never match a real dataset (all dataset ids are
-        // UUIDs), so it is simply "not present" → false. This matches the
-        // documented contract above and parity with an unknown-but-valid UUID.
+        // UUIDs), so it is simply "not present" → false.
         Err(_) => return Ok(serde_json::Value::Bool(false)),
     };
     let svc = state.services().await?;

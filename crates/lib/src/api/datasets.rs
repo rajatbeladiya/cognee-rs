@@ -44,9 +44,13 @@ pub use cognee_database::DatasetDb;
 ///   paths: under an ACL through the `delete` check, without one through the
 ///   ownership fallback (the dataset must be the caller's and in its tenant);
 ///   either way the delete then runs **by id**, never re-resolved by name;
-/// - [`Self::list_data`] and [`Self::has_data`] apply it **only under an
-///   ACL**. Without an ACL they perform no ownership or tenant check
-///   (`tenant_id` is ignored) — a known gap left to S2/S3.
+/// - [`Self::list_data`] and [`Self::has_data`] apply it on both paths:
+///   under an ACL through the `read` check, without one through the
+///   ownership fallback (the dataset must be the caller's and in its tenant,
+///   else [`DatasetError::NotFound`] — unknown, foreign and other-tenant ids
+///   alike, so there is no existence oracle).
+///
+/// In short, every per-id method applies the tenant on both paths.
 ///
 /// Under an ACL, "no grant", "a grant only in another tenant" and "unknown
 /// id" all answer [`DatasetError::PermissionDenied`] — within each method
@@ -118,16 +122,15 @@ impl DatasetManager {
     /// List all data items in a dataset, with permission check.
     ///
     /// Results are sorted by `data_size` descending (largest first), matching
-    /// Python SDK behaviour. Under an ACL, `read` in `tenant_id` is checked
-    /// first (Python `datasets.py:155@37f788bd2`).
+    /// Python SDK behaviour. The read is authorized first (Python
+    /// `datasets.py:155@37f788bd2`), see [`Self::authorize_read`].
     pub async fn list_data(
         &self,
         dataset_id: Uuid,
         owner_id: Uuid,
         tenant_id: Option<Uuid>,
     ) -> Result<Vec<Data>, DatasetError> {
-        self.check_read_permission(owner_id, tenant_id, dataset_id)
-            .await?;
+        self.authorize_read(owner_id, tenant_id, dataset_id).await?;
         let mut items = self.db.get_dataset_data(dataset_id).await?;
         items.sort_by_key(|b| std::cmp::Reverse(b.data_size));
         Ok(items)
@@ -135,17 +138,16 @@ impl DatasetManager {
 
     /// Check whether a dataset contains any data items.
     ///
-    /// Enforces read permission in `tenant_id` when ACL is configured (Python
-    /// `datasets.py:164@37f788bd2`), then uses an efficient COUNT query
-    /// instead of loading all records.
+    /// Authorizes the read first (Python `datasets.py:164@37f788bd2`, see
+    /// [`Self::authorize_read`]), then uses an efficient COUNT query instead
+    /// of loading all records.
     pub async fn has_data(
         &self,
         dataset_id: Uuid,
         owner_id: Uuid,
         tenant_id: Option<Uuid>,
     ) -> Result<bool, DatasetError> {
-        self.check_read_permission(owner_id, tenant_id, dataset_id)
-            .await?;
+        self.authorize_read(owner_id, tenant_id, dataset_id).await?;
         let count = self.db.count_dataset_data(dataset_id).await?;
         Ok(count > 0)
     }
@@ -448,6 +450,39 @@ impl DatasetManager {
             return Err(DatasetError::Delete(DeleteError::Validation(format!(
                 "Dataset {dataset_id} was not found for owner {owner_id}"
             ))));
+        }
+        Ok(())
+    }
+
+    /// Authorize a read of `dataset_id` by the caller. Python always
+    /// authorizes `list_data` / `has_data` with `get_authorized_dataset(user,
+    /// dataset_id)` (`read`) (`cognee/api/v1/datasets/datasets.py:155, 164`,
+    /// `get_authorized_dataset.py:25-29`,
+    /// `get_specific_user_permission_datasets.py:27-38` @37f788bd2).
+    ///
+    /// - **ACL**: `read` in `tenant_id` ([`DatasetError::PermissionDenied`]).
+    /// - **No ACL** (ownership replaces grants, as in
+    ///   [`Self::authorize_delete`]): the row must exist, be owned by
+    ///   `owner_id` and be in `tenant_id` (strict, `None` ⇔ NULL —
+    ///   `get_dataset_ids.py:34@37f788bd2`), otherwise
+    ///   [`DatasetError::NotFound`] for unknown, foreign and other-tenant ids
+    ///   alike. Python's ownership read `get_dataset(user_id, dataset_id)`
+    ///   likewise finds nothing for a dataset the user does not own
+    ///   (`cognee/modules/data/methods/get_dataset.py:14-15@37f788bd2`).
+    async fn authorize_read(
+        &self,
+        owner_id: Uuid,
+        tenant_id: Option<Uuid>,
+        dataset_id: Uuid,
+    ) -> Result<(), DatasetError> {
+        if self.acl_db.is_some() {
+            return self
+                .check_read_permission(owner_id, tenant_id, dataset_id)
+                .await;
+        }
+        let dataset = self.require_dataset(dataset_id).await?;
+        if dataset.owner_id != owner_id || dataset.tenant_id != tenant_id {
+            return Err(DatasetError::NotFound);
         }
         Ok(())
     }
