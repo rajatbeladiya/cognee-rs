@@ -257,9 +257,14 @@ impl AuthorizedDeleteService {
                     ));
                 }
             }
-            // Enumerated in-tenant by `execute` / `preview` and never reaches
-            // here; a no-op arm keeps the match exhaustive.
-            DeleteScope::All => {}
+            // `execute` / `preview` expand `All` into per-dataset `DatasetById`
+            // requests before authorizing, so `All` never reaches here. Fail
+            // closed rather than allow it, should a refactor route it here.
+            DeleteScope::All => {
+                return Err(DeleteError::PermissionDenied(
+                    "delete permission denied for the requested scope".to_string(),
+                ));
+            }
         }
 
         Ok(())
