@@ -2358,15 +2358,19 @@ mod tests {
 
     /// W20/D4. Scenario: the owner has `"shared"` without a tenant and
     /// `"shared"` in T1; a tenant-less caller searches by that name.
-    /// Expected: only the tenant-less row resolves (strict equality; this
-    /// also rules out `get_dataset_by_name(.., None)` picking either row).
+    /// Expected: only the tenant-less row resolves (strict equality). Verified
+    /// to fail against the pre-S1 per-name `get_dataset_by_name(.., None)`
+    /// loop with this seed order.
     #[tokio::test]
     async fn tenantless_name_resolves_only_the_tenantless_row() {
         let owner = Uuid::new_v4();
         let t1 = Uuid::new_v4();
         let db = fresh_db().await;
-        let untenanted = seed_dataset(&db, "shared", owner).await;
+        // The T1 row is seeded **first**: an unordered by-name lookup with no
+        // tenant predicate (`get_dataset_by_name(.., None)`) then tends to
+        // return it, so this test fails on the loose resolution.
         let tenanted = seed_dataset_in_tenant(&db, "shared", owner, t1).await;
+        let untenanted = seed_dataset(&db, "shared", owner).await;
 
         let mut registry = SearchTypeRegistry::new();
         registry.register(Arc::new(ResolutionFixtureRetriever {
