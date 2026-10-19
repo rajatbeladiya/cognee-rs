@@ -11,6 +11,7 @@
 use std::sync::Arc;
 
 use cognee_database::{self as database, AclDb, DatabaseConnection, DeleteDb};
+use cognee_database::{DatabaseError, GraphEdge, GraphNode};
 use cognee_delete::{
     AuthorizedDeleteService, DeleteError, DeleteMode, DeleteRequest, DeleteScope, DeleteService,
 };
@@ -711,4 +712,440 @@ async fn preview_applies_the_tenant_too() {
     )
     .await
     .expect("preview in the dataset's tenant is admitted");
+}
+
+// ---------------------------------------------------------------------------
+// Review loop 2: by-name scopes resolve tenant-strictly and are executed by
+// id; `All` reports partial progress; `preview(All)` matches `execute(All)`.
+// ---------------------------------------------------------------------------
+
+/// #2. The owner has `"same"` in T1 (seeded first) and a tenant-less `"same"`,
+/// with `delete` on both. A by-name delete resolves in the caller's tenant
+/// only (`get_dataset_ids.py:30-34@37f788bd2`) and deletes that row by id.
+#[tokio::test]
+async fn by_name_delete_resolves_and_deletes_only_in_the_callers_tenant() {
+    let (db, storage, acl) = setup().await;
+    let owner = Uuid::new_v4();
+    let t1 = Uuid::new_v4();
+    let (in_t1, data_t1) = seed_in_tenant(&db, &storage, &acl, owner, "same", Some(t1)).await;
+    let (untenanted, data_u) = seed_in_tenant(&db, &storage, &acl, owner, "same", None).await;
+    grant_delete_permission(&acl, owner, in_t1).await;
+    grant_delete_permission(&acl, owner, untenanted).await;
+    let svc = build_authorized_service(&db, &storage, &acl);
+
+    // Data scope by name, tenant-less: only the tenant-less dataset's item.
+    svc.execute(
+        &request(DeleteScope::Data {
+            owner_id: owner,
+            data_id: data_u,
+            dataset_name: Some("same".to_string()),
+            delete_dataset_if_empty: false,
+        }),
+        owner,
+        None,
+    )
+    .await
+    .expect("tenant-less by-name item delete");
+    assert!(
+        database::ops::data::get_data(&db, data_u)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        database::ops::data::get_data(&db, data_t1)
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    // A T1 item named through the tenant-less dataset does not resolve there.
+    assert!(
+        svc.execute(
+            &request(DeleteScope::Data {
+                owner_id: owner,
+                data_id: data_t1,
+                dataset_name: Some("same".to_string()),
+                delete_dataset_if_empty: false,
+            }),
+            owner,
+            None,
+        )
+        .await
+        .is_err(),
+        "the T1 item is not in the tenant-less \"same\""
+    );
+    assert!(
+        database::ops::data::get_data(&db, data_t1)
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    // Dataset scope by name, tenant-less: deletes the tenant-less row only.
+    svc.execute(
+        &request(DeleteScope::Dataset {
+            owner_id: owner,
+            dataset_name: "same".to_string(),
+        }),
+        owner,
+        None,
+    )
+    .await
+    .expect("tenant-less by-name dataset delete");
+    assert!(
+        database::ops::datasets::get_dataset(&db, untenanted)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        database::ops::datasets::get_dataset(&db, in_t1)
+            .await
+            .unwrap()
+            .is_some(),
+        "the same-named T1 dataset must survive a tenant-less by-name delete"
+    );
+
+    // Now there is no tenant-less "same" left: by name it is not found, and
+    // the T1 row is still not touched.
+    assert!(matches!(
+        svc.execute(
+            &request(DeleteScope::Dataset {
+                owner_id: owner,
+                dataset_name: "same".to_string(),
+            }),
+            owner,
+            None,
+        )
+        .await,
+        Err(DeleteError::Validation(_))
+    ));
+    assert!(
+        database::ops::datasets::get_dataset(&db, in_t1)
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    // In T1 the name resolves to the T1 row.
+    svc.execute(
+        &request(DeleteScope::Dataset {
+            owner_id: owner,
+            dataset_name: "same".to_string(),
+        }),
+        owner,
+        Some(t1),
+    )
+    .await
+    .expect("by-name delete in T1");
+    assert!(
+        database::ops::datasets::get_dataset(&db, in_t1)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// #4. Data shared between two authorized datasets: `preview(All)` must
+/// count it once (as `execute(All)` deletes it), not 0 + 0.
+#[tokio::test]
+async fn all_scope_preview_agrees_with_execute_on_shared_data() {
+    let (db, storage, acl) = setup().await;
+    let caller = Uuid::new_v4();
+    let (a, shared) = seed_in_tenant(&db, &storage, &acl, caller, "a", None).await;
+    let (b, _only_b) = seed_in_tenant(&db, &storage, &acl, caller, "b", None).await;
+    database::ops::datasets::attach_data_to_dataset(&db, b, shared)
+        .await
+        .unwrap();
+    grant_delete_permission(&acl, caller, a).await;
+    grant_delete_permission(&acl, caller, b).await;
+    let svc = build_authorized_service(&db, &storage, &acl);
+
+    let preview = svc
+        .preview(&request(DeleteScope::All), caller, None)
+        .await
+        .unwrap();
+    assert_eq!(preview.datasets_to_delete, 2);
+    assert_eq!(preview.data_to_delete, 2, "shared item once + b's own item");
+
+    let result = svc
+        .execute(&request(DeleteScope::All), caller, None)
+        .await
+        .unwrap();
+    assert_eq!(result.deleted_datasets, 2);
+    assert_eq!(result.deleted_data, preview.data_to_delete);
+}
+
+/// A `DeleteDb` over SQLite whose `delete_dataset` fails for one id.
+struct FailingDeleteOf {
+    inner: Arc<DatabaseConnection>,
+    fail_delete_of: Option<Uuid>,
+}
+
+#[async_trait::async_trait]
+impl DeleteDb for FailingDeleteOf {
+    async fn get_data(&self, id: Uuid) -> Result<Option<Data>, DatabaseError> {
+        DeleteDb::get_data(self.inner.as_ref(), id).await
+    }
+
+    async fn delete_data(&self, id: Uuid) -> Result<(), DatabaseError> {
+        DeleteDb::delete_data(self.inner.as_ref(), id).await
+    }
+
+    async fn count_data_dataset_links(&self, data_id: Uuid) -> Result<usize, DatabaseError> {
+        DeleteDb::count_data_dataset_links(self.inner.as_ref(), data_id).await
+    }
+
+    async fn list_datasets_for_data(&self, data_id: Uuid) -> Result<Vec<Dataset>, DatabaseError> {
+        DeleteDb::list_datasets_for_data(self.inner.as_ref(), data_id).await
+    }
+
+    async fn get_dataset_by_name(
+        &self,
+        name: &str,
+        owner_id: Uuid,
+        tenant_id: Option<Uuid>,
+    ) -> Result<Option<Dataset>, DatabaseError> {
+        DeleteDb::get_dataset_by_name(self.inner.as_ref(), name, owner_id, tenant_id).await
+    }
+
+    async fn get_dataset_data(&self, dataset_id: Uuid) -> Result<Vec<Data>, DatabaseError> {
+        DeleteDb::get_dataset_data(self.inner.as_ref(), dataset_id).await
+    }
+
+    async fn count_dataset_data(&self, dataset_id: Uuid) -> Result<usize, DatabaseError> {
+        DeleteDb::count_dataset_data(self.inner.as_ref(), dataset_id).await
+    }
+
+    async fn list_datasets_by_owner(&self, owner_id: Uuid) -> Result<Vec<Dataset>, DatabaseError> {
+        DeleteDb::list_datasets_by_owner(self.inner.as_ref(), owner_id).await
+    }
+
+    async fn list_datasets(&self) -> Result<Vec<Dataset>, DatabaseError> {
+        DeleteDb::list_datasets(self.inner.as_ref()).await
+    }
+
+    async fn delete_dataset(&self, id: Uuid) -> Result<(), DatabaseError> {
+        if Some(id) == self.fail_delete_of {
+            return Err(DatabaseError::QueryError(
+                "simulated delete_dataset failure".into(),
+            ));
+        }
+        DeleteDb::delete_dataset(self.inner.as_ref(), id).await
+    }
+
+    async fn detach_data_from_dataset(
+        &self,
+        dataset_id: Uuid,
+        data_id: Uuid,
+    ) -> Result<(), DatabaseError> {
+        DeleteDb::detach_data_from_dataset(self.inner.as_ref(), dataset_id, data_id).await
+    }
+
+    async fn delete_pipeline_runs_by_dataset(
+        &self,
+        dataset_id: Uuid,
+    ) -> Result<u64, DatabaseError> {
+        DeleteDb::delete_pipeline_runs_by_dataset(self.inner.as_ref(), dataset_id).await
+    }
+
+    async fn clear_pipeline_status_for_dataset(
+        &self,
+        dataset_id: Uuid,
+    ) -> Result<usize, DatabaseError> {
+        DeleteDb::clear_pipeline_status_for_dataset(self.inner.as_ref(), dataset_id).await
+    }
+
+    async fn clear_cognify_pipeline_status_for_data(
+        &self,
+        data_id: Uuid,
+        dataset_id: Uuid,
+    ) -> Result<(), DatabaseError> {
+        DeleteDb::clear_cognify_pipeline_status_for_data(self.inner.as_ref(), data_id, dataset_id)
+            .await
+    }
+
+    async fn get_nodes_by_dataset(
+        &self,
+        dataset_id: Uuid,
+    ) -> Result<Vec<GraphNode>, DatabaseError> {
+        DeleteDb::get_nodes_by_dataset(self.inner.as_ref(), dataset_id).await
+    }
+
+    async fn get_edges_by_dataset(
+        &self,
+        dataset_id: Uuid,
+    ) -> Result<Vec<GraphEdge>, DatabaseError> {
+        DeleteDb::get_edges_by_dataset(self.inner.as_ref(), dataset_id).await
+    }
+
+    async fn get_unique_nodes_for_data(
+        &self,
+        data_id: Uuid,
+        dataset_id: Uuid,
+    ) -> Result<Vec<GraphNode>, DatabaseError> {
+        DeleteDb::get_unique_nodes_for_data(self.inner.as_ref(), data_id, dataset_id).await
+    }
+
+    async fn get_unique_edges_for_data(
+        &self,
+        data_id: Uuid,
+        dataset_id: Uuid,
+    ) -> Result<Vec<GraphEdge>, DatabaseError> {
+        DeleteDb::get_unique_edges_for_data(self.inner.as_ref(), data_id, dataset_id).await
+    }
+
+    async fn delete_provenance_nodes_for_dataset(
+        &self,
+        dataset_id: Uuid,
+    ) -> Result<(), DatabaseError> {
+        DeleteDb::delete_provenance_nodes_for_dataset(self.inner.as_ref(), dataset_id).await
+    }
+
+    async fn delete_provenance_edges_for_dataset(
+        &self,
+        dataset_id: Uuid,
+    ) -> Result<(), DatabaseError> {
+        DeleteDb::delete_provenance_edges_for_dataset(self.inner.as_ref(), dataset_id).await
+    }
+
+    async fn delete_provenance_nodes_for_data(
+        &self,
+        data_id: Uuid,
+        dataset_id: Uuid,
+    ) -> Result<(), DatabaseError> {
+        DeleteDb::delete_provenance_nodes_for_data(self.inner.as_ref(), data_id, dataset_id).await
+    }
+
+    async fn delete_provenance_edges_for_data(
+        &self,
+        data_id: Uuid,
+        dataset_id: Uuid,
+    ) -> Result<(), DatabaseError> {
+        DeleteDb::delete_provenance_edges_for_data(self.inner.as_ref(), data_id, dataset_id).await
+    }
+
+    async fn get_provenance_node_count_for_data(
+        &self,
+        data_id: Uuid,
+        dataset_id: Uuid,
+    ) -> Result<usize, DatabaseError> {
+        DeleteDb::get_provenance_node_count_for_data(self.inner.as_ref(), data_id, dataset_id).await
+    }
+
+    async fn get_provenance_edge_count_for_data(
+        &self,
+        data_id: Uuid,
+        dataset_id: Uuid,
+    ) -> Result<usize, DatabaseError> {
+        DeleteDb::get_provenance_edge_count_for_data(self.inner.as_ref(), data_id, dataset_id).await
+    }
+
+    async fn delete_search_history_for_user(&self, user_id: Uuid) -> Result<u64, DatabaseError> {
+        DeleteDb::delete_search_history_for_user(self.inner.as_ref(), user_id).await
+    }
+
+    async fn delete_all_search_history(&self) -> Result<u64, DatabaseError> {
+        DeleteDb::delete_all_search_history(self.inner.as_ref()).await
+    }
+
+    async fn count_search_history_for_user(&self, user_id: Uuid) -> Result<u64, DatabaseError> {
+        DeleteDb::count_search_history_for_user(self.inner.as_ref(), user_id).await
+    }
+
+    async fn count_all_search_history(&self) -> Result<u64, DatabaseError> {
+        DeleteDb::count_all_search_history(self.inner.as_ref()).await
+    }
+}
+
+/// #3. `All` stops at the first failing dataset like Python's
+/// `delete_all` loop (`datasets.py:316-323@37f788bd2`), keeps what it already
+/// deleted, and reports it in `DeleteError::Partial`.
+#[tokio::test]
+async fn all_scope_reports_partial_progress_when_a_later_dataset_fails() {
+    let (db, storage, acl) = setup().await;
+    let caller = Uuid::new_v4();
+    for name in ["p1", "p2", "p3"] {
+        let (id, _) = seed_in_tenant(&db, &storage, &acl, caller, name, None).await;
+        grant_delete_permission(&acl, caller, id).await;
+    }
+    // The order `All` will walk (the mock's listing is stable between calls).
+    let order: Vec<Uuid> = cognee_database::ops::acl::authorized_datasets_in_tenant(
+        acl.as_ref(),
+        db.as_ref(),
+        caller,
+        "delete",
+        None,
+    )
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|d| d.id)
+    .collect();
+    assert_eq!(order.len(), 3);
+
+    let build = |fail: Uuid| {
+        let failing: Arc<dyn DeleteDb> = Arc::new(FailingDeleteOf {
+            inner: db.clone(),
+            fail_delete_of: Some(fail),
+        });
+        AuthorizedDeleteService::new(
+            DeleteService::new(storage.clone() as Arc<dyn StorageTrait>, failing.clone()),
+            acl.clone() as Arc<dyn AclDb>,
+            failing,
+        )
+    };
+
+    match build(order[1])
+        .execute(&request(DeleteScope::All), caller, None)
+        .await
+    {
+        Err(DeleteError::Partial {
+            completed,
+            failed_dataset_id,
+            source,
+        }) => {
+            assert_eq!(failed_dataset_id, order[1]);
+            assert_eq!(
+                completed.deleted_datasets, 1,
+                "the first dataset was deleted"
+            );
+            assert!(!matches!(*source, DeleteError::Partial { .. }));
+        }
+        other => panic!("expected Partial, got {other:?}"),
+    }
+    assert!(
+        database::ops::datasets::get_dataset(&db, order[0])
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        database::ops::datasets::get_dataset(&db, order[2])
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    // A failure on the very first dataset is returned as is (nothing done).
+    let remaining: Vec<Uuid> = order[1..].to_vec();
+    let first_now = cognee_database::ops::acl::authorized_datasets_in_tenant(
+        acl.as_ref(),
+        db.as_ref(),
+        caller,
+        "delete",
+        None,
+    )
+    .await
+    .unwrap()
+    .first()
+    .map(|d| d.id)
+    .unwrap();
+    assert!(remaining.contains(&first_now));
+    let err = build(first_now)
+        .execute(&request(DeleteScope::All), caller, None)
+        .await
+        .expect_err("first dataset fails");
+    assert!(!matches!(err, DeleteError::Partial { .. }), "{err:?}");
 }
