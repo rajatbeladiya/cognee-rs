@@ -241,6 +241,12 @@ pub struct PipelineUnblockArgs {
     /// Only do this when the process that started the run is known to be gone.
     #[arg(long = "clear", default_value_t = false)]
     pub clear: bool,
+
+    /// Tenant the dataset belongs to (the one the blocked run used). Datasets are matched by strict tenant equality: a
+    /// dataset added with `--tenant-id T` is found only with `--tenant-id T`;
+    /// without the flag only tenant-less datasets are reachable.
+    #[arg(long = "tenant-id")]
+    pub tenant_id: Option<String>,
 }
 
 /// Build the ANN index on every vector collection that is missing one.
@@ -356,6 +362,12 @@ pub struct MemifyArgs {
     /// Triplet extraction/embedding batch size.
     #[arg(long = "batch-size", default_value_t = 100)]
     pub batch_size: usize,
+
+    /// Tenant to run as; without `--datasets`, memify runs on the owner's datasets in this tenant. Datasets are matched by strict tenant equality: a
+    /// dataset added with `--tenant-id T` is found only with `--tenant-id T`;
+    /// without the flag only tenant-less datasets are reachable.
+    #[arg(long = "tenant-id")]
+    pub tenant_id: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -416,6 +428,12 @@ pub struct CognifyArgs {
     /// Mirrors Python's `temporal_cognify=True` parameter.
     #[arg(long = "temporal-cognify", default_value_t = false)]
     pub temporal_cognify: bool,
+
+    /// Tenant to run as; without `--datasets`, cognify runs on the owner's datasets in this tenant. Datasets are matched by strict tenant equality: a
+    /// dataset added with `--tenant-id T` is found only with `--tenant-id T`;
+    /// without the flag only tenant-less datasets are reachable.
+    #[arg(long = "tenant-id")]
+    pub tenant_id: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -449,6 +467,12 @@ pub struct AddAndCognifyArgs {
 
     #[arg(long = "llm-max-parallel-requests", value_parser = clap::value_parser!(u32).range(1..))]
     pub llm_max_parallel_requests: Option<u32>,
+
+    /// Tenant to add and cognify as (applies to both the add and the dataset lookup). Datasets are matched by strict tenant equality: a
+    /// dataset added with `--tenant-id T` is found only with `--tenant-id T`;
+    /// without the flag only tenant-less datasets are reachable.
+    #[arg(long = "tenant-id")]
+    pub tenant_id: Option<String>,
 }
 
 #[derive(Debug, Clone, ValueEnum)]
@@ -760,6 +784,12 @@ pub struct DeleteArgs {
     /// dataset via the ACL table.
     #[arg(long = "enforce-acl", default_value_t = false)]
     pub enforce_acl: bool,
+
+    /// Tenant to delete in: names and the `--user-id`/`--all` scopes resolve only in this tenant. Datasets are matched by strict tenant equality: a
+    /// dataset added with `--tenant-id T` is found only with `--tenant-id T`;
+    /// without the flag only tenant-less datasets are reachable.
+    #[arg(long = "tenant-id")]
+    pub tenant_id: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -864,11 +894,12 @@ mod tests {
         assert_eq!(cfg.logs_dir_override, None);
     }
 
-    /// `--tenant-id` reaches `search` and `recall` (symmetric with `add` /
-    /// `remember` / `improve`), so CLI-written tenanted data stays readable
-    /// under strict tenant matching.
+    /// `--tenant-id` reaches every dataset command — `search`, `recall`,
+    /// `cognify`, `memify`, `add-and-cognify`, `pipeline-unblock`, `delete` —
+    /// (symmetric with `add` / `remember` / `improve`), so CLI-written tenanted
+    /// data stays reachable under strict tenant matching.
     #[test]
-    fn tenant_id_is_accepted_by_search_and_recall() {
+    fn tenant_id_is_accepted_by_every_dataset_command() {
         let t = "6f1c2f8e-6a59-4a39-9f0e-3c1d6c1b2a10";
         match parse(&["cognee-cli", "search", "q", "--tenant-id", t]).command {
             Commands::Search(args) => assert_eq!(args.tenant_id.as_deref(), Some(t)),
@@ -881,6 +912,39 @@ mod tests {
         match parse(&["cognee-cli", "search", "q"]).command {
             Commands::Search(args) => assert_eq!(args.tenant_id, None),
             other => panic!("expected search, got {other:?}"),
+        }
+        match parse(&["cognee-cli", "cognify", "--tenant-id", t]).command {
+            Commands::Cognify(args) => assert_eq!(args.tenant_id.as_deref(), Some(t)),
+            other => panic!("expected cognify, got {other:?}"),
+        }
+        match parse(&["cognee-cli", "memify", "--tenant-id", t]).command {
+            Commands::Memify(args) => assert_eq!(args.tenant_id.as_deref(), Some(t)),
+            other => panic!("expected memify, got {other:?}"),
+        }
+        match parse(&["cognee-cli", "add-and-cognify", "x", "--tenant-id", t]).command {
+            Commands::AddAndCognify(args) => assert_eq!(args.tenant_id.as_deref(), Some(t)),
+            other => panic!("expected add-and-cognify, got {other:?}"),
+        }
+        match parse(&[
+            "cognee-cli",
+            "pipeline-unblock",
+            "-d",
+            "ds",
+            "--tenant-id",
+            t,
+        ])
+        .command
+        {
+            Commands::PipelineUnblock(args) => assert_eq!(args.tenant_id.as_deref(), Some(t)),
+            other => panic!("expected pipeline-unblock, got {other:?}"),
+        }
+        match parse(&["cognee-cli", "delete", "--all", "--tenant-id", t]).command {
+            Commands::Delete(args) => assert_eq!(args.tenant_id.as_deref(), Some(t)),
+            other => panic!("expected delete, got {other:?}"),
+        }
+        match parse(&["cognee-cli", "cognify"]).command {
+            Commands::Cognify(args) => assert_eq!(args.tenant_id, None),
+            other => panic!("expected cognify, got {other:?}"),
         }
         assert_eq!(
             crate::commands::parse_tenant_id(Some(t)).unwrap(),
