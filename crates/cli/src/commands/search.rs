@@ -13,6 +13,7 @@ use crate::error::CliError;
 
 pub fn run(args: SearchArgs, cm: Arc<ComponentManager>) -> Result<(), CliError> {
     let settings = cm.settings();
+    let log_search_history = settings.log_search_history;
 
     if !(1..=100).contains(&args.top_k) {
         return Err(CliError::Validation(
@@ -79,6 +80,7 @@ pub fn run(args: SearchArgs, cm: Arc<ComponentManager>) -> Result<(), CliError> 
                 .with_tuning(search_tuning)
                 .with_session_manager(session_manager)
                 .with_dataset_resolver(database as Arc<dyn IngestDb>)
+                .with_search_history_logging(log_search_history)
                 .build();
 
         let datasets = if args.datasets.is_empty() {
@@ -103,7 +105,6 @@ pub fn run(args: SearchArgs, cm: Arc<ComponentManager>) -> Result<(), CliError> 
             node_name_filter_operator: None,
             wide_search_top_k: None,
             triplet_distance_penalty: None,
-            save_interaction: Some(false),
             user_id: Some(owner_id),
             tenant_id,
             verbose: None,
@@ -130,6 +131,7 @@ pub fn run(args: SearchArgs, cm: Arc<ComponentManager>) -> Result<(), CliError> 
 fn map_query_type(query_type: QueryTypeArg) -> SearchType {
     match query_type {
         QueryTypeArg::GraphCompletion => SearchType::GraphCompletion,
+        QueryTypeArg::HybridCompletion => SearchType::HybridCompletion,
         QueryTypeArg::RagCompletion => SearchType::RagCompletion,
         QueryTypeArg::Chunks => SearchType::Chunks,
         QueryTypeArg::Summaries => SearchType::Summaries,
@@ -146,6 +148,7 @@ fn requires_llm(search_type: SearchType) -> bool {
     matches!(
         search_type,
         SearchType::GraphCompletion
+            | SearchType::HybridCompletion
             | SearchType::RagCompletion
             | SearchType::TripletCompletion
             | SearchType::GraphSummaryCompletion

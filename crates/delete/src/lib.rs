@@ -5156,8 +5156,9 @@ mod tests {
             let query_id = ops::search_history::log_query(
                 db,
                 &format!("test query {i}"),
-                "GraphCompletion",
+                "GRAPH_COMPLETION",
                 Some(user_id),
+                None,
             )
             .await
             .unwrap();
@@ -5166,6 +5167,7 @@ mod tests {
                 query_id,
                 &format!("{{\"result\": {i}}}"),
                 Some(user_id),
+                None,
             )
             .await
             .unwrap();

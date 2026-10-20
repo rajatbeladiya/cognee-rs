@@ -103,7 +103,7 @@ class SearchOpts(TypedDict, total=False):
     """Options accepted by :meth:`Cognee.search` / :func:`cognee_py.compat.search`."""
 
     #: One of the 16 :class:`~cognee_py.SearchType` strings.
-    #: Defaults to ``"GRAPH_COMPLETION"``.
+    #: Defaults to ``"HYBRID_COMPLETION"``.
     search_type: str
     datasets: list[str]
     dataset_ids: list[str]
@@ -116,7 +116,6 @@ class SearchOpts(TypedDict, total=False):
     only_context: bool
     use_combined_context: bool
     verbose: bool
-    save_interaction: bool
     auto_feedback_detection: bool
     user_id: str
 

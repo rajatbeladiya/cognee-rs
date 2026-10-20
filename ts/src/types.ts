@@ -129,7 +129,7 @@ export type RecallScopeString =
 
 /** Options accepted by `cogneeSearch`. All fields are optional. */
 export interface CogneeSearchOptions {
-  /** SCREAMING_SNAKE_CASE search type. Defaults to "GRAPH_COMPLETION". */
+  /** SCREAMING_SNAKE_CASE search type. Defaults to "HYBRID_COMPLETION". */
   searchType?: SearchTypeString;
   /** Dataset names to restrict the search to. */
   datasets?: string[];
@@ -164,8 +164,6 @@ export interface CogneeSearchOptions {
   useCombinedContext?: boolean;
   /** Include verbose diagnostics in the response. */
   verbose?: boolean;
-  /** Persist this query+result to search history (defaults to true). */
-  saveInteraction?: boolean;
   /** Detect feedback about the previous response before searching. */
   autoFeedbackDetection?: boolean;
   /**

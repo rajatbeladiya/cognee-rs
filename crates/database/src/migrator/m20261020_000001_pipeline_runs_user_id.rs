@@ -6,7 +6,8 @@
 //! nullable, no backfill, index `ix_pipeline_runs_user_id`, both added only
 //! when missing. Rust and Python share one SQLite file and either SDK may
 //! migrate it first, so this migration guards the column and the index the
-//! same way rather than issuing a plain `ALTER TABLE`.
+//! same way rather than issuing a plain `ALTER TABLE` (an existing column must
+//! still be nullable — `add_column_if_missing` checks it).
 //!
 //! Nullable with no default and no backfill: a row written before this
 //! migration has no recorded triggerer, and `user_id IN (…)` never matches
@@ -16,64 +17,30 @@
 //! `text`, like every id column in this schema: it holds `uuid_hex` (32 hex
 //! chars, no hyphens), which is what Python's SQLAlchemy `UUID` renders as on
 //! SQLite.
-use sea_orm::{ConnectionTrait, DbBackend, Statement};
 use sea_orm_migration::prelude::*;
+
+use super::helpers::{add_column_if_missing, drop_column_if_present};
 
 #[derive(DeriveMigrationName)]
 pub struct Migration;
 
+const TABLE: &str = "pipeline_runs";
+const COLUMN: &str = "user_id";
+/// SQLAlchemy's default name for a single-column index — Python's name.
 const INDEX: &str = "ix_pipeline_runs_user_id";
-
-/// Does `pipeline_runs` already have `user_id`?
-///
-/// `SchemaManager::has_column` is unusable here for the reason given in
-/// `m20260916_000001_provenance_pipeline_run_id`: it dispatches on
-/// sea-orm-migration's own `sqlx-*` features, which this crate does not enable.
-async fn has_user_id(manager: &SchemaManager<'_>) -> Result<bool, DbErr> {
-    let backend = manager.get_database_backend();
-    let sql = match backend {
-        DbBackend::Sqlite => {
-            "SELECT COUNT(*) AS cnt FROM pragma_table_info('pipeline_runs') WHERE name = 'user_id'"
-        }
-        DbBackend::Postgres => {
-            "SELECT COUNT(*) AS cnt FROM information_schema.columns \
-             WHERE table_schema = current_schema() AND table_name = 'pipeline_runs' \
-             AND column_name = 'user_id'"
-        }
-        other => {
-            return Err(DbErr::Custom(format!(
-                "pipeline_runs.user_id migration does not support the {other:?} backend"
-            )));
-        }
-    };
-    let row = manager
-        .get_connection()
-        .query_one(Statement::from_string(backend, sql))
-        .await?
-        .ok_or_else(|| DbErr::Custom("column-existence probe returned no row".to_owned()))?;
-    Ok(row.try_get::<i64>("", "cnt")? > 0)
-}
 
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        if !has_user_id(manager).await? {
-            manager
-                .alter_table(
-                    Table::alter()
-                        .table(PipelineRuns::Table)
-                        .add_column(ColumnDef::new(PipelineRuns::UserId).text().null())
-                        .to_owned(),
-                )
-                .await?;
-        }
+        let user_id = ColumnDef::new(Alias::new(COLUMN)).text().null().to_owned();
+        add_column_if_missing(manager, TABLE, user_id).await?;
         manager
             .create_index(
                 Index::create()
                     .if_not_exists()
                     .name(INDEX)
-                    .table(PipelineRuns::Table)
-                    .col(PipelineRuns::UserId)
+                    .table(Alias::new(TABLE))
+                    .col(Alias::new(COLUMN))
                     .to_owned(),
             )
             .await
@@ -86,26 +53,10 @@ impl MigrationTrait for Migration {
                 Index::drop()
                     .if_exists()
                     .name(INDEX)
-                    .table(PipelineRuns::Table)
+                    .table(Alias::new(TABLE))
                     .to_owned(),
             )
             .await?;
-        if has_user_id(manager).await? {
-            manager
-                .alter_table(
-                    Table::alter()
-                        .table(PipelineRuns::Table)
-                        .drop_column(PipelineRuns::UserId)
-                        .to_owned(),
-                )
-                .await?;
-        }
-        Ok(())
+        drop_column_if_present(manager, TABLE, COLUMN).await
     }
-}
-
-#[derive(DeriveIden)]
-enum PipelineRuns {
-    Table,
-    UserId,
 }

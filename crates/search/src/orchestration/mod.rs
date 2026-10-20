@@ -1,6 +1,8 @@
 mod dataset_scope;
+mod hybrid_fallback;
 mod prepare_search_result;
 mod search_execution_builder;
+mod search_history;
 mod search_orchestrator;
 mod search_type_tools;
 

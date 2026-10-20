@@ -489,7 +489,7 @@ void cg_sdk_add_and_cognify(const CgSdk*        sdk,
  *
  * query must be a non-null null-terminated UTF-8 string.
  * opts_json may be NULL or a JSON object with optional keys:
- *   "searchType"            — SCREAMING_SNAKE_CASE (default: GRAPH_COMPLETION)
+ *   "searchType"            — SCREAMING_SNAKE_CASE (default: HYBRID_COMPLETION)
  *   "datasets"              — JSON string array of dataset names
  *   "datasetIds"            — JSON UUID string array
  *   "topK"                  — integer
@@ -503,7 +503,6 @@ void cg_sdk_add_and_cognify(const CgSdk*        sdk,
  *                             or the bare context for non-completion types
  *   "useCombinedContext"    — boolean
  *   "verbose"               — boolean
- *   "saveInteraction"       — boolean (default true, matching Python SDK)
  *   "autoFeedbackDetection" — boolean
  *
  * Note: "userId" in opts is ignored — user_id in the request is always set

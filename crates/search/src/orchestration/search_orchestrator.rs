@@ -1,4 +1,5 @@
-use crate::SearchType;
+use crate::orchestration::hybrid_fallback::{passed_graph_only_knob, requested_graph_only_filter};
+use crate::orchestration::search_history::{history_query_type, history_row, log_history_row};
 use crate::orchestration::{
     SearchTypeRegistry, filter_context_to_datasets, prepare_search_result,
     scope_context_by_datasets,
@@ -6,7 +7,7 @@ use crate::orchestration::{
 use crate::retrievers::DatasetScoping;
 use crate::types::{
     SearchContext, SearchError, SearchOutput, SearchParams, SearchPrompt, SearchRequest,
-    SearchResponse,
+    SearchResponse, SearchType,
 };
 use crate::utils::detect_feedback;
 use cognee_database::{AclDb, IngestDb, SearchHistoryDb, SearchHistoryEntry};
@@ -179,6 +180,9 @@ pub struct SearchOrchestrator {
     /// System prompt file for requests that name neither a system prompt nor
     /// a prompt path.
     default_system_prompt_path: Option<String>,
+    /// When `true` (the default), searches are recorded in the wired
+    /// `database`'s search history.
+    log_search_history: bool,
 }
 
 impl SearchOrchestrator {
@@ -193,6 +197,7 @@ impl SearchOrchestrator {
             enable_access_tracking: false,
             auto_feedback_default: false,
             default_system_prompt_path: None,
+            log_search_history: true,
         }
     }
 
@@ -237,7 +242,10 @@ impl SearchOrchestrator {
 
     /// How the retriever registered for `search_type` can be restricted to
     /// datasets, or `None` when no retriever is registered for it (a search of
-    /// that type fails with `UnsupportedSearchType`).
+    /// that type fails with `UnsupportedSearchType`). For
+    /// `HybridCompletion` this is the hybrid retriever's scoping; the
+    /// `GraphCompletion` retriever it may fall back to is scoped the same way
+    /// (`Membership`) in the built-in registry.
     pub fn dataset_scoping(&self, search_type: SearchType) -> Option<DatasetScoping> {
         self.registry
             .get(search_type)
@@ -305,6 +313,12 @@ impl SearchOrchestrator {
     /// own default.
     pub fn with_default_system_prompt_path(mut self, path: Option<String>) -> Self {
         self.default_system_prompt_path = path;
+        self
+    }
+
+    /// Turn search-history recording on or off (`COGNEE_LOG_SEARCH_HISTORY`).
+    pub fn with_search_history_logging(mut self, enabled: bool) -> Self {
+        self.log_search_history = enabled;
         self
     }
 
@@ -492,6 +506,48 @@ impl SearchOrchestrator {
         }
     }
 
+    async fn resolve_retriever(
+        &self,
+        request: &SearchRequest,
+    ) -> Result<crate::retrievers::SearchRetrieverRef, SearchError> {
+        if let Some(ref custom_type) = request.custom_search_type {
+            return self.registry.get_by_name(custom_type).ok_or_else(|| {
+                SearchError::InvalidInput(format!(
+                    "No custom retriever registered for '{custom_type}'"
+                ))
+            });
+        }
+        let retriever = self.registry.get(request.search_type)?;
+        if request.search_type == SearchType::HybridCompletion {
+            return self.hybrid_or_fallback(retriever, request).await;
+        }
+        Ok(retriever)
+    }
+
+    async fn hybrid_or_fallback(
+        &self,
+        hybrid: crate::retrievers::SearchRetrieverRef,
+        request: &SearchRequest,
+    ) -> Result<crate::retrievers::SearchRetrieverRef, SearchError> {
+        if let Some(knob) = passed_graph_only_knob(request) {
+            return Err(SearchError::InvalidHybridSearchConfig(format!(
+                "{knob} requires search_type GRAPH_COMPLETION"
+            )));
+        }
+        let reason = match requested_graph_only_filter(request) {
+            Some(filter) => Some(format!("{filter} is set")),
+            None => hybrid.unavailable_reason().await,
+        };
+        if let Some(reason) = reason {
+            tracing::warn!(
+                %reason,
+                "HYBRID_COMPLETION cannot serve this search; falling back to GRAPH_COMPLETION"
+            );
+            return self.registry.get(SearchType::GraphCompletion);
+        }
+        Ok(hybrid)
+    }
+
     #[tracing::instrument(
         name = "cognee.search",
         skip(self, request),
@@ -522,16 +578,11 @@ impl SearchOrchestrator {
             .auto_feedback_detection
             .unwrap_or(self.auto_feedback_default);
 
-        let retriever: crate::retrievers::SearchRetrieverRef =
-            if let Some(ref custom_type) = request.custom_search_type {
-                self.registry.get_by_name(custom_type).ok_or_else(|| {
-                    SearchError::InvalidInput(format!(
-                        "No community retriever registered for '{custom_type}'"
-                    ))
-                })?
-            } else {
-                self.registry.get(request.search_type)?
-            };
+        let retriever = self.resolve_retriever(request).await?;
+        let search_type = match request.custom_search_type {
+            Some(_) => request.search_type,
+            None => retriever.search_type(),
+        };
         let scoping = retriever.dataset_scoping();
 
         // Authorize caller-supplied dataset UUIDs. Python runs every explicit
@@ -744,23 +795,11 @@ impl SearchOrchestrator {
                 retriever.search_type()
             )));
         }
-        let should_save_interaction = request.save_interaction.unwrap_or(true);
-        let query_type = format!("{:?}", request.search_type);
-        let mut logged_query_id = None;
-
-        if should_save_interaction
-            && let Some(database) = &self.database
-            && let Ok(query_id) = database
-                .log_query(&request.query_text, &query_type, request.user_id)
-                .await
-        {
-            logged_query_id = Some(query_id);
-        }
 
         if acl_scoped && !use_dataset_scope {
             // The caller may read no dataset at all: nothing to search.
             let response = prepare_search_result(
-                request.search_type,
+                search_type,
                 SearchOutput::Items(Vec::new()),
                 None,
                 request.dataset_ids.clone(),
@@ -768,8 +807,7 @@ impl SearchOrchestrator {
                 request.use_combined_context(),
                 request.verbose(),
             );
-            self.log_result_if_enabled(logged_query_id, &response, request.user_id)
-                .await;
+            self.log_search_history(request, &response).await;
             emit_search_completed(request);
             return Ok(response);
         }
@@ -887,7 +925,7 @@ impl SearchOrchestrator {
                 None => SearchOutput::Items(output_context.clone()),
             };
             let mut response = prepare_search_result(
-                request.search_type,
+                search_type,
                 result,
                 Some(output_context),
                 request.dataset_ids.clone(),
@@ -905,8 +943,7 @@ impl SearchOrchestrator {
                 response.context = Some(scoped_context_map);
             }
 
-            self.log_result_if_enabled(logged_query_id, &response, request.user_id)
-                .await;
+            self.log_search_history(request, &response).await;
 
             emit_search_completed(request);
             return Ok(response);
@@ -982,7 +1019,7 @@ impl SearchOrchestrator {
                         .response_to_user
                         .unwrap_or_else(|| "Thank you for your feedback!".to_string());
                     let response = prepare_search_result(
-                        request.search_type,
+                        search_type,
                         SearchOutput::Text(acknowledgment),
                         None,
                         request.dataset_ids.clone(),
@@ -1019,15 +1056,15 @@ impl SearchOrchestrator {
         //   `extract_context_object_ids(retrieved_objects)` on EVERY
         //   completion path (`hybrid_retriever.py:242-296`). Scoped to the
         //   hybrid retriever and only when a session will actually be saved.
-        let fetch_for_tracking = self.enable_access_tracking
-            && retriever.search_type() != crate::types::SearchType::Feedback;
+        let fetch_for_tracking =
+            self.enable_access_tracking && retriever.search_type() != SearchType::Feedback;
         // TEMPORAL is hybrid underneath and inherits the same completion path
         // in Python (`TemporalHybridRetriever` subclasses `HybridRetriever`).
         let fetch_for_session = request.session_id.is_some()
             && self.session_manager.is_some()
             && matches!(
                 retriever.search_type(),
-                crate::types::SearchType::HybridCompletion | crate::types::SearchType::Temporal
+                SearchType::HybridCompletion | SearchType::Temporal
             );
         let context = if context.is_none() && (fetch_for_tracking || fetch_for_session) {
             let ctx = retriever.get_context(&request.query_text, &params).await?;
@@ -1083,7 +1120,7 @@ impl SearchOrchestrator {
         }
 
         let mut response = prepare_search_result(
-            request.search_type,
+            search_type,
             output,
             context,
             request.dataset_ids.clone(),
@@ -1098,8 +1135,7 @@ impl SearchOrchestrator {
             response.context = Some(scoped_context_map);
         }
 
-        self.log_result_if_enabled(logged_query_id, &response, request.user_id)
-            .await;
+        self.log_search_history(request, &response).await;
 
         emit_search_completed(request);
         Ok(response)
@@ -1148,20 +1184,15 @@ impl SearchOrchestrator {
         }
     }
 
-    async fn log_result_if_enabled(
-        &self,
-        query_id: Option<uuid::Uuid>,
-        response: &SearchResponse,
-        user_id: Option<uuid::Uuid>,
-    ) {
-        let (Some(query_id), Some(database)) = (query_id, &self.database) else {
+    /// Record the search in history as one query and result row.
+    async fn log_search_history(&self, request: &SearchRequest, response: &SearchResponse) {
+        let Some(database) = self.database.as_ref().filter(|_| self.log_search_history) else {
             return;
         };
-
-        if let Ok(serialized_response) = serde_json::to_string(response) {
-            let _ = database
-                .log_result(query_id, &serialized_response, user_id)
-                .await;
+        let query_type = history_query_type(request.search_type);
+        let row = history_row(request, response);
+        if let Err(error) = log_history_row(database.as_ref(), request, &query_type, &row).await {
+            tracing::warn!(%error, "failed to record search history");
         }
     }
 }
@@ -1249,7 +1280,6 @@ mod tests {
             node_name_filter_operator: None,
             wide_search_top_k: None,
             triplet_distance_penalty: None,
-            save_interaction: None,
             user_id: None,
             tenant_id: None,
             verbose: None,
@@ -1297,7 +1327,6 @@ mod tests {
             node_name_filter_operator: None,
             wide_search_top_k: None,
             triplet_distance_penalty: None,
-            save_interaction: None,
             user_id: None,
             tenant_id: None,
             verbose: None,
@@ -1350,7 +1379,6 @@ mod tests {
             node_name_filter_operator: None,
             wide_search_top_k: None,
             triplet_distance_penalty: None,
-            save_interaction: None,
             user_id: None,
             tenant_id: None,
             verbose: None,
@@ -1430,7 +1458,6 @@ mod tests {
             node_name_filter_operator: None,
             wide_search_top_k: None,
             triplet_distance_penalty: None,
-            save_interaction: None,
             user_id: None,
             tenant_id: None,
             verbose: None,
@@ -1533,7 +1560,6 @@ mod tests {
             node_name_filter_operator: None,
             wide_search_top_k: None,
             triplet_distance_penalty: None,
-            save_interaction: None,
             user_id: None,
             tenant_id: None,
             verbose: None,
@@ -1728,7 +1754,6 @@ mod tests {
             node_name_filter_operator: None,
             wide_search_top_k: None,
             triplet_distance_penalty: None,
-            save_interaction: None,
             user_id: None,
             tenant_id: None,
             verbose: Some(true),
@@ -1754,7 +1779,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn persists_query_and_result_when_save_interaction_enabled() {
+    async fn persists_query_and_result_by_default() {
         let mut registry = SearchTypeRegistry::new();
         registry.register(Arc::new(FakeChunksRetriever));
 
@@ -1780,7 +1805,6 @@ mod tests {
             node_name_filter_operator: None,
             wide_search_top_k: None,
             triplet_distance_penalty: None,
-            save_interaction: Some(true),
             user_id: None,
             tenant_id: None,
             verbose: None,
@@ -1810,6 +1834,53 @@ mod tests {
         );
     }
 
+    async fn history_orchestrator(logging: bool) -> super::SearchOrchestrator {
+        let mut registry = SearchTypeRegistry::new();
+        registry.register(Arc::new(FakeChunksRetriever));
+        let db = connect("sqlite::memory:").await.unwrap();
+        initialize(&db).await.unwrap();
+        super::SearchOrchestrator::new(registry)
+            .with_database(Arc::new(db) as Arc<dyn SearchHistoryDb>)
+            .with_search_history_logging(logging)
+    }
+
+    #[tokio::test]
+    async fn no_history_is_recorded_when_logging_is_off() {
+        let orchestrator = history_orchestrator(false).await;
+        let request: SearchRequest =
+            serde_json::from_str(r#"{"query_text": "hello", "search_type": "CHUNKS"}"#).unwrap();
+
+        orchestrator.search(&request).await.unwrap();
+
+        let history = orchestrator.get_history(None, Some(10)).await.unwrap();
+        assert!(history.is_empty());
+    }
+
+    #[tokio::test]
+    async fn history_records_the_dataset_and_type() {
+        let orchestrator = history_orchestrator(true).await;
+        let dataset = uuid::Uuid::new_v4();
+        let json = format!(
+            r#"{{"query_text": "hello", "search_type": "CHUNKS", "dataset_ids": ["{dataset}"]}}"#
+        );
+        let request: SearchRequest = serde_json::from_str(&json).unwrap();
+
+        orchestrator.search(&request).await.unwrap();
+
+        let history = orchestrator.get_history(None, Some(10)).await.unwrap();
+        assert_eq!(history.len(), 2);
+        assert!(
+            history
+                .iter()
+                .all(|entry| entry.dataset_id == Some(dataset))
+        );
+        let query = history
+            .iter()
+            .find(|entry| entry.entry_type == SearchHistoryEntryType::Query)
+            .unwrap();
+        assert_eq!(query.query_type.as_deref(), Some("CHUNKS"));
+    }
+
     #[tokio::test]
     async fn search_batch_returns_one_response_per_request() {
         let mut registry = SearchTypeRegistry::new();
@@ -1834,7 +1905,6 @@ mod tests {
                 node_name_filter_operator: None,
                 wide_search_top_k: None,
                 triplet_distance_penalty: None,
-                save_interaction: None,
                 user_id: None,
                 tenant_id: None,
                 verbose: None,
@@ -1863,7 +1933,6 @@ mod tests {
                 node_name_filter_operator: None,
                 wide_search_top_k: None,
                 triplet_distance_penalty: None,
-                save_interaction: None,
                 user_id: None,
                 tenant_id: None,
                 verbose: None,
@@ -1911,7 +1980,6 @@ mod tests {
             node_name_filter_operator: None,
             wide_search_top_k: None,
             triplet_distance_penalty: None,
-            save_interaction: None,
             user_id: None,
             tenant_id: None,
             verbose: None,
@@ -2012,7 +2080,6 @@ mod tests {
             node_name_filter_operator: None,
             wide_search_top_k: None,
             triplet_distance_penalty: None,
-            save_interaction: Some(false),
             user_id: None,
             tenant_id: None,
             verbose: None,
@@ -3705,7 +3772,6 @@ mod tests {
             node_name_filter_operator: None,
             wide_search_top_k: None,
             triplet_distance_penalty: None,
-            save_interaction: None,
             user_id: None,
             tenant_id: None,
             verbose: None,
@@ -4024,5 +4090,93 @@ mod tests {
                 .load(std::sync::atomic::Ordering::SeqCst),
             0
         );
+    }
+
+    struct FakeTypedRetriever {
+        search_type: SearchType,
+        unavailable_reason: Option<String>,
+    }
+
+    #[async_trait]
+    impl SearchRetriever for FakeTypedRetriever {
+        fn search_type(&self) -> SearchType {
+            self.search_type
+        }
+
+        async fn get_context(
+            &self,
+            _query: &str,
+            _params: &SearchParams,
+        ) -> Result<SearchContext, SearchError> {
+            Ok(vec![])
+        }
+
+        async fn get_completion(
+            &self,
+            _query: &str,
+            _context: Option<SearchContext>,
+            _session: &SessionContext,
+            _params: &SearchParams,
+        ) -> Result<SearchOutput, SearchError> {
+            Ok(SearchOutput::Text(format!("{:?}", self.search_type)))
+        }
+
+        async fn unavailable_reason(&self) -> Option<String> {
+            self.unavailable_reason.clone()
+        }
+    }
+
+    fn hybrid_orchestrator(unavailable_reason: Option<&str>) -> super::SearchOrchestrator {
+        let mut registry = SearchTypeRegistry::new();
+        registry.register(Arc::new(FakeTypedRetriever {
+            search_type: SearchType::HybridCompletion,
+            unavailable_reason: unavailable_reason.map(str::to_string),
+        }));
+        registry.register(Arc::new(FakeTypedRetriever {
+            search_type: SearchType::GraphCompletion,
+            unavailable_reason: None,
+        }));
+        super::SearchOrchestrator::new(registry)
+    }
+
+    fn untyped_request(extra: &str) -> SearchRequest {
+        serde_json::from_str(&format!(r#"{{"query_text": "q"{extra}}}"#)).unwrap()
+    }
+
+    #[tokio::test]
+    async fn untyped_search_runs_hybrid() {
+        let response = hybrid_orchestrator(None)
+            .search(&untyped_request(""))
+            .await
+            .unwrap();
+        assert_eq!(response.search_type, SearchType::HybridCompletion);
+    }
+
+    #[tokio::test]
+    async fn unavailable_hybrid_falls_back_to_graph_completion() {
+        let response = hybrid_orchestrator(Some("DocumentChunk_text collection missing"))
+            .search(&untyped_request(""))
+            .await
+            .unwrap();
+        assert_eq!(response.search_type, SearchType::GraphCompletion);
+        assert!(matches!(response.result, SearchOutput::Text(ref t) if t == "GraphCompletion"));
+    }
+
+    #[tokio::test]
+    async fn graph_only_filter_falls_back_to_graph_completion() {
+        let response = hybrid_orchestrator(None)
+            .search(&untyped_request(r#", "neighborhood_depth": 2"#))
+            .await
+            .unwrap();
+        assert_eq!(response.search_type, SearchType::GraphCompletion);
+    }
+
+    #[tokio::test]
+    async fn graph_only_knob_is_rejected_on_hybrid() {
+        let error = hybrid_orchestrator(None)
+            .search(&untyped_request(r#", "wide_search_top_k": 100"#))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, SearchError::InvalidHybridSearchConfig(_)));
     }
 }

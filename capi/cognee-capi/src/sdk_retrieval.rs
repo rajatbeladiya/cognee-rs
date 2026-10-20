@@ -40,7 +40,7 @@ use crate::sdk_ops::parse_c_str_or_fire;
 ///
 /// `query` is the search query string (required, non-null).
 /// `opts_json` may be `NULL` or a JSON object with optional fields:
-///   "searchType"             — SCREAMING_SNAKE_CASE string (default GRAPH_COMPLETION)
+///   "searchType"             — SCREAMING_SNAKE_CASE string (default HYBRID_COMPLETION)
 ///   "datasets"               — string array of dataset names
 ///   "datasetIds"             — UUID string array
 ///   "topK"                   — integer
@@ -54,7 +54,6 @@ use crate::sdk_ops::parse_c_str_or_fire;
 ///                              or the bare context for non-completion types
 ///   "useCombinedContext"     — boolean
 ///   "verbose"                — boolean
-///   "saveInteraction"        — boolean (default true)
 ///   "autoFeedbackDetection"  — boolean
 ///
 /// `userId` from opts is ignored; `user_id` in `SearchRequest` is always set

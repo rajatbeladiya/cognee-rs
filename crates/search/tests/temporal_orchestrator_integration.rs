@@ -120,6 +120,7 @@ impl SearchHistoryDb for NoOpHistoryDb {
         _query_text: &str,
         _query_type: &str,
         _user_id: Option<Uuid>,
+        _dataset_id: Option<Uuid>,
     ) -> Result<Uuid, DatabaseError> {
         Ok(Uuid::new_v4())
     }
@@ -129,6 +130,7 @@ impl SearchHistoryDb for NoOpHistoryDb {
         _query_id: Uuid,
         _serialized_result: &str,
         _user_id: Option<Uuid>,
+        _dataset_id: Option<Uuid>,
     ) -> Result<Uuid, DatabaseError> {
         Ok(Uuid::new_v4())
     }
@@ -302,7 +304,6 @@ fn temporal_request() -> SearchRequest {
         node_name_filter_operator: None,
         wide_search_top_k: None,
         triplet_distance_penalty: None,
-        save_interaction: Some(false),
         user_id: None,
         tenant_id: None,
         verbose: None,
