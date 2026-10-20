@@ -8,6 +8,7 @@ mod m20260916_000001_provenance_edge_id_rekey_guard;
 mod m20260916_000001_provenance_pipeline_run_id;
 mod m20260917_000001_graph_slug_indexes;
 mod m20260918_000001_align_node_index_names;
+mod m20261020_000001_pipeline_runs_user_id;
 
 pub struct Migrator;
 
@@ -52,6 +53,7 @@ pub fn core_migrations() -> Vec<Box<dyn MigrationTrait>> {
         Box::new(m20260916_000001_provenance_pipeline_run_id::Migration),
         Box::new(m20260917_000001_graph_slug_indexes::Migration),
         Box::new(m20260918_000001_align_node_index_names::Migration),
+        Box::new(m20261020_000001_pipeline_runs_user_id::Migration),
     ]
 }
 
