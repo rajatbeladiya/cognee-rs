@@ -57,57 +57,70 @@ export interface CogneeCognifyOptions {
 
 /**
  * A custom graph model in the spec DSL: entities with typed fields and
- * relations. Mirrors Python's `GraphSchemaSpec`; every snake_case key also
- * accepts its camelCase alias, and unknown keys are rejected. See
+ * relations. Mirrors Python's `GraphSchemaSpec`. Every key may be spelled in
+ * camelCase (as the cognee frontend writes it) or snake_case (as Python and
+ * the docs write it), but not both at once; unknown keys are rejected. See
  * docs/guides/custom-graph-schema.md.
  */
 export interface GraphSchemaSpec {
-  options?: { autoTypeNodes?: boolean; auto_type_nodes?: boolean };
+  options?: { autoTypeNodes?: boolean } | { auto_type_nodes?: boolean };
   /** Entity used as the top-level model; defaults to the first entity. */
   root?: string | null;
   /** 1 to 50 entities. */
   entities: GraphEntitySpec[];
 }
 
+/** `camel` or `snake`: one spelling of an optional key, never both. */
+type EitherKey<Camel extends string, Snake extends string, T> =
+  | ({ [K in Camel]?: T } & { [K in Snake]?: never })
+  | ({ [K in Snake]?: T } & { [K in Camel]?: never });
+
+/** `camel` or `snake`: one spelling of a required key. */
+type OneKey<Camel extends string, Snake extends string, T> =
+  | ({ [K in Camel]: T } & { [K in Snake]?: never })
+  | ({ [K in Snake]: T } & { [K in Camel]?: never });
+
 /** One entity (node type) of a {@link GraphSchemaSpec}. */
-export interface GraphEntitySpec {
+export type GraphEntitySpec = {
   /** An identifier: a letter, then letters, digits or underscores. */
   name: string;
   description?: string | null;
-  primaryLabelField?: string | null;
-  /** Fields embedded for search; empty or unset means `["name"]`. */
-  indexFields?: string[] | null;
-  /** Fields that merge equal nodes; unset means `["name"]`, `[]` opts out. */
-  identityFields?: string[] | null;
   /** Up to 40 fields. */
   fields?: GraphFieldSpec[];
+} & EitherKey<"primaryLabelField", "primary_label_field", string | null> &
+  /** Fields embedded for search; empty or unset means `["name"]`. */
+  EitherKey<"indexFields", "index_fields", string[] | null> &
+  /** Fields that merge equal nodes; unset means `["name"]`, `[]` opts out. */
+  EitherKey<"identityFields", "identity_fields", string[] | null>;
+
+/** Accepted for frontend parity; not compiled. */
+export interface GraphInverseSpec {
+  enabled?: boolean;
+  name?: string | null;
+  cardinality?: "one" | "many" | null;
 }
 
 /** One field of a {@link GraphEntitySpec}, discriminated by `kind`. */
 export type GraphFieldSpec =
-  | {
+  | ({
       kind: "primitive";
       name: string;
-      primitiveType?: "string" | "number" | "boolean" | "date";
       required?: boolean;
       description?: string | null;
-    }
-  | {
+    } & EitherKey<"primitiveType", "primitive_type", "string" | "number" | "boolean" | "date">)
+  | ({
       kind: "enum";
       name: string;
-      enumValues: string[];
       required?: boolean;
       description?: string | null;
-    }
+    } & OneKey<"enumValues", "enum_values", string[]>)
   | {
       kind: "relation";
       name: string;
       relation: {
-        targetEntityName: string;
         cardinality?: "one" | "many";
-        /** Accepted for frontend parity; not compiled. */
-        inverse?: { enabled?: boolean; name?: string | null; cardinality?: "one" | "many" | null } | null;
-      };
+        inverse?: GraphInverseSpec | null;
+      } & OneKey<"targetEntityName", "target_entity_name", string>;
       required?: boolean;
       description?: string | null;
     };
