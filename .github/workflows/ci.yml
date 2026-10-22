@@ -80,6 +80,13 @@ env:
   # updates touch /usr/bin/cc+gcc mtimes and would silently invalidate the
   # whole cache. Hash the compiler content instead.
   CCACHE_COMPILERCHECK: content
+  # Pin the interpreter pyo3-build-config resolves. Without this it probes
+  # whatever `python3` the image ships (3.14 on ubuntu-26.04, newer than PyO3
+  # 0.23 supports), and it caches that result in OUT_DIR, re-resolving only
+  # when a PYO3_* variable changes, so a rust-cache saved on one image can
+  # carry a stale interpreter into another. python3.12 is noble's system
+  # Python. maturin-driven jobs set their own PYO3_PYTHON and are unaffected.
+  PYO3_PYTHON: python3.12
 
 jobs:
   # Every Linux job pins ubuntu-24.04 rather than ubuntu-latest. On 2026-10-22
