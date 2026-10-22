@@ -143,7 +143,7 @@ impl PyPipeline {
                 .await
                 .map_err(execution_error_to_pyerr)?;
 
-            Python::attach(|py| results_to_py(py, &results))
+            crate::gil::attach_or_err(|py| results_to_py(py, &results))
         })
     }
 
@@ -229,7 +229,7 @@ impl PyPipelineRunHandle {
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let run_result = handle.wait().await.map_err(execution_error_to_pyerr)?;
-            Python::attach(|py| results_to_py(py, &run_result.outputs))
+            crate::gil::attach_or_err(|py| results_to_py(py, &run_result.outputs))
         })
     }
 }

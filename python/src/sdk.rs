@@ -191,7 +191,7 @@ impl PyCognee {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             handle.services().await.map_err(sdk_error_to_py)?;
             // Return Python None (not the empty tuple that Ok(()) would produce).
-            Python::attach(|py| Ok(py.None()))
+            crate::gil::attach_or_err(|py| Ok(py.None()))
         })
     }
 
