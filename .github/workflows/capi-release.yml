@@ -21,7 +21,8 @@ on:
         type: string
   # Also on PRs that change the Linux build environment or the glibc floor,
   # so a change to either is proven on the real release legs before merge
-  # instead of on the next tag. Everything that publishes is skipped on
+  # instead of on the next tag (Linux legs only — see the `plan` job).
+  # Everything that publishes is skipped on
   # pull_request (see the publish/release job conditions).
   pull_request:
     branches: [ main ]
@@ -46,51 +47,69 @@ env:
   CARGO_PROFILE_RELEASE_DEBUG: "0"
 
 jobs:
+  # ── Plan: which legs to build ────────────────────────────────────────
+  # The matrix lives here, not inline in `build-platform`, so it can depend on
+  # the event: tag pushes and dispatches build every leg; pull_request (which
+  # only fires for changes to the Linux build environment, see `on:`) builds
+  # just the Linux legs, since nothing those paths control can affect the
+  # macOS / Windows legs and those are the slowest, coldest builds. A job-level
+  # `if:` cannot see `matrix`, and `exclude` cannot remove `include`-only
+  # entries, hence a job output. Each leg is one JSON object below; the
+  # comments are the reasons each leg looks the way it does.
+  plan:
+    name: Plan build legs
+    runs-on: ubuntu-24.04
+    outputs:
+      legs: ${{ steps.legs.outputs.legs }}
+    steps:
+      - id: legs
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          # linux-x86_64:
+          #   Linux x64 glibc — also via `cross`, in the pinned ubuntu:24.04 image
+          #   (ci/cross/x86_64-gnu.Dockerfile), NOT natively on the runner: a
+          #   native build takes its glibc floor from the runner image, which
+          #   moved to glibc 2.43 when ubuntu-latest became 26.04. The floor is
+          #   recorded in ci/linux-glibc-floor.txt and asserted after the build.
+          # linux-aarch64:
+          #   Linux aarch64 — cross via `cross`
+          # macos-aarch64:
+          #   NOTE: no macos-x86_64 (x86_64-apple-darwin). ort 2.0.0-rc.12 ships no
+          #   prebuilt ONNX Runtime for that target (its dist manifest bundles ORT
+          #   1.24.2, which Microsoft no longer builds for x86_64 macOS as of ORT
+          #   1.24.1), so ort-sys errors "does not provide prebuilt binaries for the
+          #   target x86_64-apple-darwin". Intel macOS is also EOL and GitHub is
+          #   retiring its x86_64 runners. Dropped rather than carry a red leg —
+          #   matches ts-prebuild.yml, which dropped darwin-x64 for the same reason.
+          #   macOS aarch64 (Apple Silicon). macos-15 (Xcode 16.4): the older
+          #   macos-14 default (Xcode 15.4) ships a libc++ whose std::construct_at
+          #   trips a C++20 aggregate-init bug compiling lbug's bundled C++.
+          # windows-x86_64:
+          #   Windows x86_64
+          legs=$(jq -c -s . <<'EOF'
+          {"os": "ubuntu-24.04", "target": "x86_64-unknown-linux-gnu", "cross": true, "archive_suffix": "linux-x86_64"}
+          {"os": "ubuntu-24.04", "target": "aarch64-unknown-linux-gnu", "cross": true, "archive_suffix": "linux-aarch64"}
+          {"os": "macos-15", "target": "aarch64-apple-darwin", "cross": false, "archive_suffix": "macos-aarch64"}
+          {"os": "windows-latest", "target": "x86_64-pc-windows-msvc", "cross": false, "archive_suffix": "windows-x86_64"}
+          EOF
+          )
+          if [ "$EVENT" = pull_request ]; then
+            legs=$(jq -c '[.[] | select(.target | test("linux"))]' <<<"$legs")
+          fi
+          echo "legs=$legs" >> "$GITHUB_OUTPUT"
+          jq . <<<"$legs"
+
   # ── Build per-platform release tarballs ──────────────────────────────
   build:
     name: Build ${{ matrix.archive_suffix }}
+    needs: plan
     strategy:
       fail-fast: false
+      # Legs and their rationale: the `plan` job above.
       matrix:
-        include:
-          # Linux x64 glibc — also via `cross`, in the pinned ubuntu:24.04 image
-          # (ci/cross/x86_64-gnu.Dockerfile), NOT natively on the runner: a
-          # native build takes its glibc floor from the runner image, which
-          # moved to glibc 2.43 when ubuntu-latest became 26.04. The floor is
-          # recorded in ci/linux-glibc-floor.txt and asserted after the build.
-          - os: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
-            cross: true
-            archive_suffix: linux-x86_64
-
-          # Linux aarch64 — cross via `cross`
-          - os: ubuntu-24.04
-            target: aarch64-unknown-linux-gnu
-            cross: true
-            archive_suffix: linux-aarch64
-
-          # NOTE: no macos-x86_64 (x86_64-apple-darwin). ort 2.0.0-rc.12 ships no
-          # prebuilt ONNX Runtime for that target (its dist manifest bundles ORT
-          # 1.24.2, which Microsoft no longer builds for x86_64 macOS as of ORT
-          # 1.24.1), so ort-sys errors "does not provide prebuilt binaries for the
-          # target x86_64-apple-darwin". Intel macOS is also EOL and GitHub is
-          # retiring its x86_64 runners. Dropped rather than carry a red leg —
-          # matches ts-prebuild.yml, which dropped darwin-x64 for the same reason.
-
-          # macOS aarch64 (Apple Silicon). macos-15 (Xcode 16.4): the older
-          # macos-14 default (Xcode 15.4) ships a libc++ whose std::construct_at
-          # trips a C++20 aggregate-init bug compiling lbug's bundled C++.
-          - os: macos-15
-            target: aarch64-apple-darwin
-            cross: false
-            archive_suffix: macos-aarch64
-
-          # Windows x86_64
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            cross: false
-            archive_suffix: windows-x86_64
-
+        include: ${{ fromJSON(needs.plan.outputs.legs) }}
     runs-on: ${{ matrix.os }}
     # 150, not 45. The windows-x86_64 leg never reached a real compile before —
     # the wrong-linker bug (see the native build step) killed it ~4 minutes in, so

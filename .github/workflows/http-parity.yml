@@ -133,12 +133,13 @@ jobs:
       # But a plain runner build links against the RUNNER's glibc, and the
       # binaries then run in the harness image: when ubuntu-latest became 26.04
       # (glibc 2.43) they failed there with `GLIBC_2.43 not found`. So the
-      # compile runs inside the Dockerfile's `rust-build-env` stage — the
-      # harness base image plus C/C++ build deps — with the checkout, rustup
-      # toolchain and cargo home bind-mounted at their host paths. The target
-      # dir stays on the runner for rust-cache; the glibc and libstdc++ are the
-      # harness's own, by construction. Full rationale: the Dockerfile's
-      # stage-1 note.
+      # compile runs in the Dockerfile's `rust-build-env` stage — the harness
+      # base image plus C/C++ build deps — via
+      # e2e-cross-sdk/build-rust-binaries.sh, the same script developers run
+      # locally. It bind-mounts the checkout, rustup toolchain and cargo home at
+      # their host paths, so the target dir stays on the runner for rust-cache
+      # while glibc and libstdc++ are the harness's own, by construction; then
+      # it checks both binaries load in the bare harness base.
       #
       # Cold runs (first main run after a toolchain bump) cost about what the
       # in-image build did; warm runs skip nearly all of it.
@@ -154,24 +155,6 @@ jobs:
       # passes straight through) and whose gcc would miss the host-gcc entries
       # ci.yml writes anyway. The lbug objects are still cached — as part of
       # the cargo target dir that rust-cache persists.
-      - name: Build the Rust build environment (harness base + build deps)
-        id: buildenv
-        run: |
-          set -euo pipefail
-          # The single source of truth for the base image is the Dockerfile's
-          # `ARG HARNESS_BASE=` line; the build-env and harness stages both
-          # use it. Fail loudly if that line is renamed or removed.
-          base=$(sed -n 's/^ARG HARNESS_BASE=//p' cognee-rust/e2e-cross-sdk/Dockerfile)
-          if [ -z "$base" ]; then
-            echo "::error::no 'ARG HARNESS_BASE=' line in cognee-rust/e2e-cross-sdk/Dockerfile" >&2
-            exit 1
-          fi
-          echo "harness_base=$base" >> "$GITHUB_OUTPUT"
-          # Context is the monorepo root like the compose build, so the same
-          # Dockerfile.dockerignore allowlist applies; this stage COPYs nothing.
-          docker build --target rust-build-env -t cognee-e2e-rust-build-env \
-            -f cognee-rust/e2e-cross-sdk/Dockerfile .
-          docker run --rm cognee-e2e-rust-build-env sh -c 'ldd --version | head -1; g++ --version | head -1'
 
       # Its own key: this is a --release tree, disjoint from the debug caches
       # ci.yml keeps. Main-only save, matching the policy in ci.yml — branches
@@ -204,13 +187,13 @@ jobs:
         shell: bash
         run: bash cognee-rust/ci/ort/ensure-cache-usable.sh cognee-rust/target/ort-cache
 
-      - name: Build release binaries
-        working-directory: cognee-rust
+      - name: Build release binaries (in the harness base) and check they load there
         env:
           # ort-sys downloads the ONNX Runtime static library here; keeping it
           # under target/ is what lets the cache above pick it up.
           ORT_CACHE_DIR: ${{ github.workspace }}/cognee-rust/target/ort-cache
           CARGO_INCREMENTAL: "0"
+          CARGO_TERM_COLOR: always
           # Strip debug info for these binaries only. The workspace
           # release profile is `debug = "line-tables-only"`, which is right for
           # shipped artifacts but is a large share of the target dir — and this
@@ -226,66 +209,7 @@ jobs:
           # a harness failure is reproduced by re-running the phase rather than
           # read off a stack trace.
           CARGO_PROFILE_RELEASE_DEBUG: "0"
-        run: |
-          set -euo pipefail
-          # In the harness-based build env (previous step). Mounts are at the
-          # host paths, so absolute paths in the target dir's fingerprints are
-          # the same on every run, and the uid is the runner's, so rust-cache
-          # can read, prune and save what the container wrote. HOME points at
-          # a scratch dir: the runner's HOME is not mounted.
-          cargo_home="${CARGO_HOME:-$HOME/.cargo}"
-          rustup_home="${RUSTUP_HOME:-$HOME/.rustup}"
-          # One invocation for both: separate `cargo build -p X` calls resolve
-          # features per-subgraph and build duplicate variants of shared deps
-          # (that cost 44 min before it was fixed). No `--features` here — the
-          # `bin` and `dev-mock` flags this line used to carry belonged to
-          # cognee-http-server, which has moved out of this repository.
-          docker run --rm \
-            --user "$(id -u):$(id -g)" \
-            -e HOME=/tmp \
-            -e CARGO_HOME="$cargo_home" -e RUSTUP_HOME="$rustup_home" \
-            -e PATH="$cargo_home/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
-            -e ORT_CACHE_DIR -e CARGO_INCREMENTAL -e CARGO_PROFILE_RELEASE_DEBUG \
-            -e CARGO_TERM_COLOR=always \
-            -v "$cargo_home:$cargo_home" -v "$rustup_home:$rustup_home" \
-            -v "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE" \
-            -w "$PWD" \
-            cognee-e2e-rust-build-env \
-            cargo build --release \
-              -p cognee-cli \
-              -p cognee-telemetry-emit
-          mkdir -p dist
-          cp target/release/cognee-cli \
-             target/release/cognee-telemetry-emit \
-             dist/
-          ls -la dist/
-          # A real gate: catch a copy that silently did not happen here,
-          # rather than at container start.
-          for b in cognee-cli cognee-telemetry-emit; do
-            test -x "dist/$b" || { echo "error: dist/$b missing or not executable" >&2; exit 1; }
-          done
-
-      # Resolve the binaries' shared libraries in the bare harness base — the
-      # image they will actually run in, without the build env's extra
-      # packages. ldd reports both a missing library and a too-old one
-      # ("version `GLIBC_2.43' not found"), so either fails here, in seconds,
-      # rather than as an opaque container start failure in a parity phase.
-      - name: Assert the binaries load in the harness base image
-        working-directory: cognee-rust
-        env:
-          HARNESS_BASE: ${{ steps.buildenv.outputs.harness_base }}
-        run: |
-          set -euo pipefail
-          for b in cognee-cli cognee-telemetry-emit; do
-            echo "── ldd $b in $HARNESS_BASE"
-            out=$(docker run --rm -v "$PWD/dist:/dist:ro" "$HARNESS_BASE" ldd "/dist/$b" 2>&1) || true
-            echo "$out"
-            if grep -q "not found" <<<"$out"; then
-              echo "::error::dist/$b does not load in $HARNESS_BASE (see ldd output above)" >&2
-              exit 1
-            fi
-          done
-          docker run --rm -v "$PWD/dist:/dist:ro" "$HARNESS_BASE" /dist/cognee-cli --version
+        run: bash cognee-rust/e2e-cross-sdk/build-rust-binaries.sh
 
       # NOTE on layer caching — measured and rejected, do not re-add blindly.
       #

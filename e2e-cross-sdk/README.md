@@ -25,14 +25,13 @@ isolated tmpfs workspaces and compares the resulting SQLite state.
 cd cognee-rust/e2e-cross-sdk
 touch ../.env                         # stub required by docker-compose env_file
 
-# Build the binaries the image expects, from the cognee-rust repo root:
-#   cargo build --release -p cognee-cli -p cognee-telemetry-emit
-#   mkdir -p dist && cp target/release/cognee-cli \
-#     target/release/cognee-telemetry-emit dist/
-# A host build only runs in the image if the host's glibc is no newer than
-# the harness's (Debian Trixie, 2.41). Otherwise build inside the
-# `rust-build-env` stage as CI does — the Dockerfile's stage-1 note has the
-# exact commands.
+# Build the binaries the image expects, from the cognee-rust repo root —
+# in the harness's own base image, exactly as CI does (needs docker and a
+# stock rustup install; see the script header):
+#   bash e2e-cross-sdk/build-rust-binaries.sh
+# Not a plain host `cargo build --release`: that links against the host's
+# glibc, and the binaries fail to start in the harness (Debian Trixie,
+# glibc 2.41) on any newer host.
 
 # Telemetry parity (no LLM):
 docker compose -f docker-compose.yml run --rm e2e-telemetry

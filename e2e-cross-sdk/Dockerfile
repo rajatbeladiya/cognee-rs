@@ -26,9 +26,9 @@ ARG HARNESS_BASE=python:3.12-slim-trixie
 #
 # This stage keeps both properties. It is only the *toolchain environment* —
 # HARNESS_BASE plus the C/C++ build deps — and holds no sources and no Rust
-# toolchain. CI builds just this target, then runs `cargo build` in it with the
-# runner's checkout, rustup toolchain and cargo home bind-mounted at their host
-# paths. The target dir therefore stays on the runner (rust-cache still works,
+# toolchain. e2e-cross-sdk/build-rust-binaries.sh (run by CI and by hand alike)
+# builds just this target, then runs `cargo build` in it with the checkout,
+# rustup toolchain and cargo home bind-mounted at their host paths. The target dir therefore stays on the runner (rust-cache still works,
 # and the absolute paths in its fingerprints match run to run), while the
 # compile and link happen against the harness's own glibc and libstdc++.
 #
@@ -42,22 +42,14 @@ ARG HARNESS_BASE=python:3.12-slim-trixie
 # build-dependency of ort-sys (its download script uses ureq + native-tls) —
 # so the build env needs libssl-dev, which the ubuntu runner had preinstalled.
 #
-# To build the image outside CI, produce the binaries first, the same way.
-# From the cognee-rust repo root (they must land in cognee-rust/dist/, where
-# the COPYs below expect them; the build context is the monorepo root above):
-#   docker build --target rust-build-env -t cognee-e2e-rust-build-env \
-#     -f e2e-cross-sdk/Dockerfile ..
-#   C="${CARGO_HOME:-$HOME/.cargo}" R="${RUSTUP_HOME:-$HOME/.rustup}"
-#   docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp \
-#     -e CARGO_HOME="$C" -e RUSTUP_HOME="$R" \
-#     -e PATH="$C/bin:/usr/local/bin:/usr/bin:/bin" \
-#     -v "$C:$C" -v "$R:$R" -v "$PWD:$PWD" -w "$PWD" \
-#     cognee-e2e-rust-build-env \
-#     cargo build --release -p cognee-cli -p cognee-telemetry-emit
-#   mkdir -p dist && cp target/release/cognee-cli \
-#     target/release/cognee-telemetry-emit dist/
-# (A plain host `cargo build --release` also works, as long as the host's
-# glibc is no newer than HARNESS_BASE's.)
+# To build the image outside CI, produce the binaries first, the same way CI
+# does — from the cognee-rust repo root:
+#   bash e2e-cross-sdk/build-rust-binaries.sh
+# It leaves them in cognee-rust/dist/, where the COPYs below expect them (the
+# image's build context is the monorepo root above), and checks they load in
+# HARNESS_BASE. Do not substitute a host `cargo build --release`: it links
+# against the host's glibc, and on any host newer than HARNESS_BASE the
+# binaries fail to start in this image ("GLIBC_2.xx not found").
 FROM ${HARNESS_BASE} AS rust-build-env
 
 # build-essential: gcc/g++ + libc6-dev, i.e. the glibc and libstdc++ the
