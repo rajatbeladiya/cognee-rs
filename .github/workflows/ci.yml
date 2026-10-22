@@ -199,10 +199,17 @@ jobs:
 
       # Sub-second path-contract check for the bindings/ workspace. Lives in the
       # lint job rather than its own, because ts-prebuild.yml and
-      # java-prebuild.yml never run on PRs and a dedicated job would cost a
-      # runner to assert a handful of paths.
+      # java-prebuild.yml run on PRs only when their build environment changes
+      # and a dedicated job would cost a runner to assert a handful of paths.
       - name: Check bindings layout contract
         run: bash ci/assert-bindings-layout.sh
+
+      # Self-test of the glibc-floor assertion the Linux prebuild legs run on
+      # their artifacts. Those legs only run on PRs that touch their build
+      # environment, so without this a broken script or floor file would
+      # first show up on a release tag. Sub-second; mirrored in community.yml.
+      - name: Self-test the glibc floor assertion
+        run: bash ci/assert-glibc-floor.test.sh
 
       - name: Compilation check
         run: cargo check --all-targets

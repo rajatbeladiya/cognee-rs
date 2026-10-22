@@ -21,6 +21,18 @@ on:
   # without needing a version bump / new tag. The publish steps are
   # idempotent (skip-if-already-on-registry), so re-running is safe.
   workflow_dispatch:
+  # Also on PRs that change the Linux build environment or the glibc floor,
+  # so a change to either is proven on the real release legs before merge
+  # instead of on the next tag. Everything that publishes is skipped on
+  # pull_request (see the publish/release job conditions).
+  pull_request:
+    branches: [ main ]
+    paths:
+      - ".github/workflows/ts-prebuild.yml"
+      - "bindings/Cross.toml"
+      - "ci/cross/**"
+      - "ci/assert-glibc-floor.sh"
+      - "ci/linux-glibc-floor.txt"
 
 concurrency:
   group: ts-prebuild-${{ github.ref }}
@@ -49,11 +61,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Linux x64 glibc — native runner
+          # Linux x64 glibc — also via `cross`, in the pinned ubuntu:24.04 image
+          # (ci/cross/x86_64-gnu.Dockerfile), NOT natively on the runner: a
+          # native build takes its glibc floor from the runner image, which
+          # moved to glibc 2.43 when ubuntu-latest became 26.04. The floor is
+          # recorded in ci/linux-glibc-floor.txt and asserted after the build.
           - platform: linux-x64-gnu
             runner: ubuntu-24.04
             rust-target: x86_64-unknown-linux-gnu
-            cross: false
+            cross: true
 
           # Linux arm64 glibc — cross via `cross`
           - platform: linux-arm64-gnu
@@ -98,17 +114,9 @@ jobs:
         if: matrix.cross
         run: cargo install cross --git https://github.com/cross-rs/cross
 
-      # mold linker (Linux only, native builds only).
-      - name: Install mold linker
-        if: runner.os == 'Linux' && !matrix.cross
-        uses: rui314/setup-mold@v1
-        with:
-          make-default: true
-
-      # cmake + protoc needed by lbug and qdrant on Linux.
-      - name: Install native build deps (Linux)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y cmake protobuf-compiler
+      # No Linux native-deps / mold steps: both Linux legs build inside the
+      # cross images (ci/cross/*.Dockerfile), which carry cmake, protoc and the
+      # compilers themselves.
 
       # cmake + protoc on macOS.
       - name: Install native build deps (macOS)
@@ -156,8 +164,10 @@ jobs:
           echo "CFLAGS_x86_64_pc_windows_msvc=/MD" >> "$GITHUB_ENV"
           echo "CXXFLAGS_x86_64_pc_windows_msvc=/MD" >> "$GITHUB_ENV"
 
-      - name: ccache (lbug bundled C++, restore-only)
-        if: runner.os != 'Windows'
+      # macOS only: the Linux legs compile in cross containers, which cannot
+      # see the runner's ccache (scripts/ccache-launcher.sh passes through).
+      - name: ccache (lbug bundled C++)
+        if: runner.os == 'macOS'
         uses: hendrikmuhs/ccache-action@v1.2
         with:
           key: lbug-cxx-${{ matrix.platform }}
@@ -169,7 +179,8 @@ jobs:
       - name: Cache cargo (bindings workspace)
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: ts-neon-${{ matrix.platform }}-v2
+          # v3: linux-x64-gnu moved from a native runner build to cross.
+          shared-key: ts-neon-${{ matrix.platform }}-v3
           workspaces: bindings -> target
           cache-on-failure: true
 
@@ -231,17 +242,18 @@ jobs:
         working-directory: bindings
         # bindings/Cross.toml mounts the whole repo (volumes=COGNEE_REPO_ROOT)
         # so the workspace's ../ts, ../java and ../crates path-deps resolve in
-        # the container, and selects a gcc-11 image for the arm64 target (lbug
-        # needs C++20 / libstdc++ 11). cross mounts the workspace target at
-        # /target. Disable simsimd's advanced ARM SIMD kernels (SVE / NEON-bf16)
-        # the cross toolchain can't assemble.
+        # the container, and selects the pinned build image per target
+        # (ci/cross/*.Dockerfile). cross mounts the workspace target at
+        # /target. On arm64, disable simsimd's advanced ARM SIMD kernels (SVE /
+        # NEON-bf16) the cross toolchain can't assemble.
         env:
           ORT_CACHE_DIR: /target/ort-cache
           COGNEE_REPO_ROOT: ${{ github.workspace }}
         run: |
-          SVE="-DSIMSIMD_TARGET_NEON_I8=0 -DSIMSIMD_TARGET_NEON_F16=0 -DSIMSIMD_TARGET_NEON_BF16=0 -DSIMSIMD_TARGET_SVE=0 -DSIMSIMD_TARGET_SVE_I8=0 -DSIMSIMD_TARGET_SVE_F16=0 -DSIMSIMD_TARGET_SVE_BF16=0 -DSIMSIMD_TARGET_SVE2=0"
-          TGT_US=$(echo "${{ matrix.rust-target }}" | tr '-' '_')
-          export CFLAGS_${TGT_US}="$SVE" CXXFLAGS_${TGT_US}="$SVE"
+          if [ "${{ matrix.rust-target }}" = aarch64-unknown-linux-gnu ]; then
+            SVE="-DSIMSIMD_TARGET_NEON_I8=0 -DSIMSIMD_TARGET_NEON_F16=0 -DSIMSIMD_TARGET_NEON_BF16=0 -DSIMSIMD_TARGET_SVE=0 -DSIMSIMD_TARGET_SVE_I8=0 -DSIMSIMD_TARGET_SVE_F16=0 -DSIMSIMD_TARGET_SVE_BF16=0 -DSIMSIMD_TARGET_SVE2=0"
+            export CFLAGS_aarch64_unknown_linux_gnu="$SVE" CXXFLAGS_aarch64_unknown_linux_gnu="$SVE"
+          fi
           cross build --release -p cognee-ts-neon --target ${{ matrix.rust-target }}
 
       # Copy the built artifact into the platform package directory.
@@ -264,6 +276,14 @@ jobs:
             echo "error: could not find Neon cdylib in $TARGET_DIR" >&2
             exit 1
           fi
+
+      # The promised glibc / libstdc++ floor for this target
+      # (ci/linux-glibc-floor.txt), checked on the artifact itself, so a build
+      # image or dependency change that raises it fails here instead of
+      # shipping a library that will not load on older distros.
+      - name: Assert the glibc floor (Linux)
+        if: runner.os == 'Linux'
+        run: bash ci/assert-glibc-floor.sh --target ${{ matrix.rust-target }} ts/platform-packages/${{ matrix.platform }}/cognee_ts_neon.node
 
       - name: Copy artifact (Windows)
         if: runner.os == 'Windows'
@@ -317,7 +337,10 @@ jobs:
     # always(): publish whatever platforms built, even if some matrix legs fail
     # (not every platform's cross toolchain is solved yet). Publishing is
     # idempotent and skips platforms whose artifact is absent.
-    if: ${{ always() && needs.check-token.outputs.has_token == 'true' }}
+    #
+    # Never on pull_request: PR runs (path-filtered, see `on:`) only prove the
+    # build legs.
+    if: ${{ always() && github.event_name != 'pull_request' && needs.check-token.outputs.has_token == 'true' }}
 
     env:
       NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
