@@ -298,6 +298,56 @@ Chunk attachment requires a custom graph schema. It is also rejected for
 temporal cognify, by the same Rust decision as `graph_schema` above: Python
 ignores `temporal_cognify` on this path rather than rejecting it.
 
+### FromIdentity references (Rust-only keyword)
+
+A reference field marked `"x-cognee-from-identity": true` is answered by the
+LLM with the target's identity string (a list of them for an array field)
+instead of a nested object. The string is then widened back into the target
+node: `"Acme"` becomes `{"name": "Acme"}` for a target whose `identity_fields`
+is `["name"]`, so it gets the same id as the full `Acme` node, extracted
+alongside it or already in the graph. This is Python's
+`Annotated[Company, FromIdentity()]` marker:
+
+```json
+"employer": {
+    "anyOf": [{ "$ref": "#/$defs/Company" }, { "type": "null" }],
+    "default": null,
+    "x-cognee-from-identity": true
+}
+```
+
+**The keyword is Rust-only.** Python's marker exists only on hand-written
+Pydantic classes; its schema converter and spec DSL have no JSON form for it.
+A schema that uses the keyword still runs in Python, but Python ignores the
+keyword and asks for nested objects.
+
+The rules are Python's `_llm_identity_field_for`. They are checked when the
+schema is compiled, so a violation fails before any LLM call (as
+`DynamicGraphError::InvalidReferenceType`, with Python's
+`InvalidReferenceTypeError` wording):
+
+- **Shape:** the field holds one model as a `$ref`, a `$ref` or `null`, or an
+  array of `$ref` (optionally or `null`). A union of models, a scalar, a
+  non-model `$defs` entry and an array of nullable items are rejected.
+- **Identity:** the target declares exactly one `identity_fields` entry.
+- **Constructible:** every other required field of the target has a default,
+  so the target can be built from the identity string alone.
+- **Marker value:** the keyword takes `true` or `false`. It may sit on the
+  field or inside it, such as on the `anyOf` variant, as Python finds a marker
+  at any depth.
+
+In the schema sent to the LLM the field becomes `string`, `string` or `null`,
+or an array of `string`. Its `default` and `title` are kept, and its
+description is replaced with Python's `"The {identity field} of a {Target}
+already in the graph"`. An answered object is still accepted as the nested
+model, as Python leaves a non-string answer untouched.
+
+A reference becomes a node holding only the identity value and the target's
+defaults. Within one storage batch the first occurrence of an id wins (see
+above), so a full answer reached earlier keeps its properties. A reference
+stored in a later batch is written over the existing node with those defaults,
+as Python's adapters upsert it.
+
 ### Spec DSL
 
 A custom graph model can also be written in the hand-writable spec DSL that
