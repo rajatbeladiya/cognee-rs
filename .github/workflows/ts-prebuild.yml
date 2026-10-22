@@ -169,7 +169,7 @@ jobs:
       - name: Cache cargo (bindings workspace)
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: ts-neon-${{ matrix.platform }}-v1
+          shared-key: ts-neon-${{ matrix.platform }}-v2
           workspaces: bindings -> target
           cache-on-failure: true
 

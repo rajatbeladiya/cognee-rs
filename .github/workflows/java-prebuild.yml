@@ -178,7 +178,7 @@ jobs:
       - name: Cache cargo (bindings workspace)
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: java-jni-${{ matrix.platform }}-v1
+          shared-key: java-jni-${{ matrix.platform }}-v2
           workspaces: bindings -> target
           cache-on-failure: true
 

@@ -77,7 +77,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: publish-dry-run-v1
+          shared-key: publish-dry-run-v2
           cache-on-failure: true
 
       - name: Generate lockfile if missing

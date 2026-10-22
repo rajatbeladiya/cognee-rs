@@ -45,7 +45,10 @@ jobs:
   # ubuntu-latest became ubuntu-26.04, which ships Python 3.14 (newer than
   # PyO3 0.23 supports) and glibc 2.43 (binaries built on it no longer run in
   # the Debian e2e harness image). Move off 24.04 deliberately, in one PR that
-  # also touches community.yml, http-parity.yml and the prebuild workflows.
+  # changes every `runs-on:` / matrix runner under .github/workflows/ at once,
+  # updates PYO3_PYTHON above (python3.12 does not exist on 26.04), and bumps
+  # every rust-cache shared-key (the key does not include the image, so a
+  # target dir built on the old image would otherwise be restored on the new).
   # ── Lint: fmt + check + clippy (no secrets) ───────────────────────────
   lint:
     name: Lint (fmt + check + clippy)
@@ -89,7 +92,7 @@ jobs:
       - name: Cache cargo/target (lint)
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: workspace-lint-v6
+          shared-key: workspace-lint-v7
 
       - name: Cache ORT binary
         uses: actions/cache@v4
@@ -189,7 +192,7 @@ jobs:
       - name: Cache cargo/target (test)
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: workspace-test-v6
+          shared-key: workspace-test-v7
           cache-on-failure: true
 
       - name: Cache ORT binary
@@ -289,7 +292,7 @@ jobs:
       - name: Cache cargo/target (test, restore-only)
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: workspace-test-v6
+          shared-key: workspace-test-v7
           save-if: "false"
 
       # No ORT cache step — see the ci.yml twin: `cognee-graph` pulls in no
@@ -408,7 +411,7 @@ jobs:
       - name: Cache cargo/target (test, restore-only)
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: workspace-test-v6
+          shared-key: workspace-test-v7
           save-if: "false"
 
       - name: Cache ORT binary
@@ -533,7 +536,7 @@ jobs:
       - name: Cache cargo/target (test, restore-only)
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: workspace-test-v6
+          shared-key: workspace-test-v7
           save-if: "false"
 
       # Needed here (unlike the graph lane): `cognee`'s default features include
@@ -649,7 +652,7 @@ jobs:
       - name: Cache cargo/target (test, restore-only)
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: workspace-test-v6
+          shared-key: workspace-test-v7
           save-if: "false"
 
       # `session.ttl_seconds` on Redis: the store arms an expiry on every key

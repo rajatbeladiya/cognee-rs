@@ -164,7 +164,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: cognee-rust -> target
-          shared-key: http-parity-release-v2
+          shared-key: http-parity-release-v3
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Cache ORT binary

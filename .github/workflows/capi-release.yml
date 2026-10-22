@@ -136,7 +136,7 @@ jobs:
       - name: Cache cargo (capi workspace)
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: capi-release-${{ matrix.archive_suffix }}-v1
+          shared-key: capi-release-${{ matrix.archive_suffix }}-v2
           workspaces: capi -> target
           cache-on-failure: true
 

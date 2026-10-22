@@ -120,7 +120,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: release-publish-v1
+          shared-key: release-publish-v2
           cache-on-failure: true
 
       # ── 0. Credential preflight — fail before ANY irreversible action ──────
