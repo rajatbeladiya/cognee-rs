@@ -42,12 +42,75 @@ export interface CogneeCognifyOptions {
    */
   graphSchema?: Record<string, unknown> | string;
   /**
+   * The same custom graph model written in the spec DSL (an object, or a
+   * string holding one), compiled natively into a `graphSchema` — Python's
+   * `cognee.low_level.GraphSchemaSpec`. Not together with `graphSchema`.
+   */
+  graphSpec?: GraphSchemaSpec | string;
+  /**
    * How each chunk links to the custom graph extracted from it: `"direct"`
    * (the root, the default) or `"all"` (every stored node). Requires
-   * `graphSchema`.
+   * `graphSchema` or `graphSpec`.
    */
   chunkAttachment?: "direct" | "all";
 }
+
+/**
+ * A custom graph model in the spec DSL: entities with typed fields and
+ * relations. Mirrors Python's `GraphSchemaSpec`; every snake_case key also
+ * accepts its camelCase alias, and unknown keys are rejected. See
+ * docs/guides/custom-graph-schema.md.
+ */
+export interface GraphSchemaSpec {
+  options?: { autoTypeNodes?: boolean; auto_type_nodes?: boolean };
+  /** Entity used as the top-level model; defaults to the first entity. */
+  root?: string | null;
+  /** 1 to 50 entities. */
+  entities: GraphEntitySpec[];
+}
+
+/** One entity (node type) of a {@link GraphSchemaSpec}. */
+export interface GraphEntitySpec {
+  /** An identifier: a letter, then letters, digits or underscores. */
+  name: string;
+  description?: string | null;
+  primaryLabelField?: string | null;
+  /** Fields embedded for search; empty or unset means `["name"]`. */
+  indexFields?: string[] | null;
+  /** Fields that merge equal nodes; unset means `["name"]`, `[]` opts out. */
+  identityFields?: string[] | null;
+  /** Up to 40 fields. */
+  fields?: GraphFieldSpec[];
+}
+
+/** One field of a {@link GraphEntitySpec}, discriminated by `kind`. */
+export type GraphFieldSpec =
+  | {
+      kind: "primitive";
+      name: string;
+      primitiveType?: "string" | "number" | "boolean" | "date";
+      required?: boolean;
+      description?: string | null;
+    }
+  | {
+      kind: "enum";
+      name: string;
+      enumValues: string[];
+      required?: boolean;
+      description?: string | null;
+    }
+  | {
+      kind: "relation";
+      name: string;
+      relation: {
+        targetEntityName: string;
+        cardinality?: "one" | "many";
+        /** Accepted for frontend parity; not compiled. */
+        inverse?: { enabled?: boolean; name?: string | null; cardinality?: "one" | "many" | null } | null;
+      };
+      required?: boolean;
+      description?: string | null;
+    };
 
 /**
  * A data item row. Mirrors `cognee_models::Data` (Serialize).
