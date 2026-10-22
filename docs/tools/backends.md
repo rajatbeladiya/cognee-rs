@@ -43,7 +43,11 @@ Notes:
   than `top_k` rows is discarded and the search is answered by the exact scan
   instead, in the same statement — a `LIMIT` is never silently unmet while the
   collection holds that many rows. On a full answer the exact branch is never
-  started.
+  started. The fallback's answer is the exact scan's, so zero-norm stored
+  vectors (which the cosine index does not store) come back last with a `NaN`
+  score, as they already do on every exact path; a zero-norm *query* never
+  falls back, because it cannot rank anything. How many queries of a search
+  fell back is recorded on its span as `cognee.vector.exact_fallbacks`.
   **Two pgvector version floors, both probed.** `hnsw.iterative_scan` needs
   pgvector 0.8+. On a pool the adapter opens itself it is a connection *option*,
   applied before any extension library loads, so an older server turns it into a

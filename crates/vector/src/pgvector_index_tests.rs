@@ -266,7 +266,7 @@ async fn backfill_replaces_an_invalid_index_left_by_a_failed_build() {
 /// component around them now and then (about 1 run in 20 here, and on an
 /// ubuntu-26.04 CI runner): the scan then returns 49 rows at any `ef_search`.
 /// The adapter's exact fallback covers that; the case pinned deterministically
-/// is `a_search_trapped_in_a_closed_hnsw_component_still_returns_top_k`.
+/// is `an_index_that_cannot_see_rows_is_completed_by_the_exact_scan`.
 #[tokio::test]
 async fn a_search_returns_top_k_rows_even_above_the_default_ef_search() {
     with_temp_db(
@@ -342,29 +342,26 @@ async fn index_forced_adapter(url: &str, dimension: usize) -> PgVectorAdapter {
         .unwrap()
 }
 
-/// The search and the batched search, both asked for `top_k` against `query`,
-/// with the row counts each returned.
-async fn search_counts(
+/// `[x0, x1, 0, …]` in 8 dimensions.
+fn v8(x0: f32, x1: f32) -> Vec<f32> {
+    vec![x0, x1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+}
+
+/// How many rows the HNSW index scan alone returns for `query` over
+/// `<coll>_f`, at the widest `ef_search` pgvector accepts and with the
+/// iterative scan on: what the search would answer without its exact fallback.
+/// Ordered by [`PgVectorAdapter::candidate_order_expr`], so it asks whichever
+/// index this server actually has (fp16, or the legacy full-precision one).
+async fn raw_index_scan_rows(
+    url: &str,
     adapter: &PgVectorAdapter,
     coll: &str,
     query: &[f32],
     top_k: usize,
-) -> (usize, Vec<usize>) {
-    let single = adapter
-        .search_similar(coll, "f", query, top_k)
-        .await
-        .unwrap();
-    let batched = adapter
-        .batch_search_similar(coll, "f", &[query.to_vec(), query.to_vec()], top_k)
-        .await
-        .unwrap();
-    (single.len(), batched.iter().map(Vec::len).collect())
-}
-
-/// How many rows the HNSW index scan alone returns for `query`, at the widest
-/// `ef_search` pgvector accepts and with the iterative scan on: what the search
-/// would answer without its exact fallback.
-async fn raw_index_scan_rows(url: &str, coll: &str, query: &str, top_k: usize) -> i64 {
+) -> i64 {
+    let literal = format!("'{}'", PgVectorAdapter::format_vector(query));
+    let order =
+        PgVectorAdapter::candidate_order_expr(&literal, query.len(), top_k, adapter.halfvec, false);
     let db = Database::connect(url).await.unwrap();
     let txn = sea_orm::TransactionTrait::begin(&db).await.unwrap();
     txn.execute_unprepared(
@@ -376,11 +373,7 @@ async fn raw_index_scan_rows(url: &str, coll: &str, query: &str, top_k: usize) -
     let row = txn
         .query_one(Statement::from_string(
             DatabaseBackend::Postgres,
-            format!(
-                r#"SELECT count(*) AS n FROM (SELECT id FROM "{coll}_f"
-                     ORDER BY vector::halfvec(8) <=> '{query}'::halfvec(8)
-                     LIMIT {top_k}) s"#
-            ),
+            format!(r#"SELECT count(*) AS n FROM (SELECT id FROM "{coll}_f" ORDER BY {order} LIMIT {top_k}) s"#),
         ))
         .await
         .unwrap()
@@ -391,23 +384,20 @@ async fn raw_index_scan_rows(url: &str, coll: &str, query: &str, top_k: usize) -
 
 /// The mechanism behind the CI failure of
 /// `a_search_returns_top_k_rows_even_above_the_default_ef_search` (49 of 100
-/// rows on an ubuntu-26.04 runner), made reproducible on any machine.
+/// rows on an ubuntu-26.04 runner), reproduced as often as the graph allows.
 ///
 /// 1 000 vectors `[1, i·6e-8, 0, …]` are distinct in fp16 — so pgvector does
 /// not fold them into one element's heap-TID list — but every pair, and every
 /// one against the query, sits at a cosine distance that rounds to exactly 0 in
 /// `f32`. Built in one batch (the rebuild path, so a `CREATE INDEX`), their
 /// layer-0 neighbour lists fill with each other and close into components of
-/// ~50 elements with no edge out. The query descends into one and is trapped:
-/// the raw index scan returns 49-73 rows here on every run measured (40 of 40),
-/// at any `ef_search` and with the iterative scan on, because the scan resumes
-/// only from candidates it discarded and a component smaller than the beam
-/// discards none. The adapter has to notice the short answer and fall back to
-/// the exact scan.
-///
-/// The raw scan's count is asserted to be short as well, so that if a pgvector
-/// release ever stops closing these components the case says so instead of
-/// silently passing without exercising the fallback.
+/// ~50 elements with no edge out, and the query is trapped in one: the raw
+/// index scan returned 49-73 rows on every run measured (70 of 70, locally and
+/// on an ubuntu-26.04 runner), at any `ef_search` and with the iterative scan
+/// on. It is still a property of random element levels, so a run where the
+/// graph happens to connect is reported and not failed — the adapter's answer
+/// is asserted either way, and the fallback itself is pinned deterministically
+/// by `an_index_that_cannot_see_rows_is_completed_by_the_exact_scan`.
 #[tokio::test]
 async fn a_search_trapped_in_a_closed_hnsw_component_still_returns_top_k() {
     with_temp_db(
@@ -417,28 +407,38 @@ async fn a_search_trapped_in_a_closed_hnsw_component_still_returns_top_k() {
             adapter.create_collection("Trap", "f", 8).await.unwrap();
             let points: Vec<_> = (0..1000u16)
                 .map(|i| {
-                    let v = vec![1.0, f32::from(i) * 6e-8, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+                    let v = v8(1.0, f32::from(i) * 6e-8);
                     crate::models::VectorPoint::new(uuid::Uuid::new_v4(), v)
                 })
                 .collect();
             adapter.index_points("Trap", "f", &points).await.unwrap();
 
-            let raw = raw_index_scan_rows(&url, "Trap", "[1,0,0,0,0,0,0,0]", 100).await;
-            assert!(
-                raw < 100,
-                "precondition: the HNSW scan alone must come back short here ({raw} rows) \
-                 for this case to exercise the exact fallback"
-            );
+            let query = v8(1.0, 0.0);
+            let raw = raw_index_scan_rows(&url, &adapter, "Trap", &query, 100).await;
+            if raw >= 100 {
+                eprintln!(
+                    "note: the HNSW graph happened to connect on this run (raw index scan \
+                     returned {raw} rows), so this case did not exercise the exact fallback"
+                );
+            }
 
-            let query = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
-            let (single, batched) = search_counts(&adapter, "Trap", &query, 100).await;
+            let single = adapter
+                .search_similar("Trap", "f", &query, 100)
+                .await
+                .unwrap();
             assert_eq!(
-                single, 100,
+                single.len(),
+                100,
                 "the index scan returned {raw} rows; the search must fall back to the exact \
-                 scan rather than return {single}"
+                 scan rather than return {}",
+                single.len()
             );
+            let batched = adapter
+                .batch_search_similar("Trap", "f", &[query.clone(), query], 100)
+                .await
+                .unwrap();
             assert_eq!(
-                batched,
+                batched.iter().map(Vec::len).collect::<Vec<_>>(),
                 vec![100, 100],
                 "every batched query needs the same fallback"
             );
@@ -449,62 +449,221 @@ async fn a_search_trapped_in_a_closed_hnsw_component_still_returns_top_k() {
     .await;
 }
 
-/// The fallback is keyed on the answer coming back short, not on the graph, so
-/// it covers every way an index scan can miss rows that exist. This one is
-/// deterministic: the cosine HNSW index does not store zero-norm vectors at
-/// all, so with 60 real rows and 90 all-zero ones the index can return at most
-/// 60 of a top-100.
+/// The exact fallback, pinned deterministically, on both search paths.
 ///
-/// The answer must be the exact scan's — the one an indexless collection (a
-/// bulk load) or a `top_k` above 1000 already gives: the 60 real rows first in
-/// score order, then 40 zero-norm rows with a `NaN` score.
+/// The fp16 index cannot store a vector whose components all underflow
+/// `halfvec` (below ~3e-8): cast to `halfvec(8)` it is all zeros, and the
+/// cosine index skips zero-norm values. Its full-precision score is perfectly
+/// valid, though. So 60 ordinary rows plus 90 rows of magnitude ~1e-9 give an
+/// index that can return at most 60 of a top-100, on every run — and the 90
+/// tiny rows score *higher* than most of the 60, so a wrong answer is visible
+/// in the ranking too, not just the count. (On a pre-`halfvec` server the
+/// legacy full-precision index stores them, nothing is short, and the case
+/// says so and stops.)
+///
+/// The batch mixes three queries so the LATERAL path has to re-evaluate the
+/// materialised candidates and the gate per query, with different outcomes:
+/// the ordinary query falls back; a zero-norm query must *not* (it scores
+/// every row `NaN`, so the exact scan could rank nothing — see
+/// `zero_norm_queries_keep_the_index_answer_and_zero_norm_rows_rank_last`); and a third, different direction falls back to its own ranking
+/// rather than reusing the first query's rows.
 #[tokio::test]
-async fn a_search_the_index_cannot_fill_is_answered_by_the_exact_scan() {
+async fn an_index_that_cannot_see_rows_is_completed_by_the_exact_scan() {
     with_temp_db(
-        "a_search_the_index_cannot_fill_is_answered_by_the_exact_scan",
+        "an_index_that_cannot_see_rows_is_completed_by_the_exact_scan",
         |url| async move {
             let adapter = index_forced_adapter(&url, 8).await;
-            adapter.create_collection("Zero", "f", 8).await.unwrap();
+            adapter.create_collection("Tiny", "f", 8).await.unwrap();
             let points: Vec<_> = (0..150u16)
                 .map(|i| {
                     let v = if i < 60 {
-                        vec![1.0, f32::from(i) * 0.01, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+                        v8(1.0, f32::from(i) * 0.01)
                     } else {
-                        vec![0.0; 8]
+                        v8(1e-9, f32::from(i - 60) * 1e-12)
                     };
                     crate::models::VectorPoint::new(uuid::Uuid::new_v4(), v)
                 })
                 .collect();
-            adapter.index_points("Zero", "f", &points).await.unwrap();
+            adapter.index_points("Tiny", "f", &points).await.unwrap();
 
-            let raw = raw_index_scan_rows(&url, "Zero", "[1,0,0,0,0,0,0,0]", 100).await;
+            let query = v8(1.0, 0.0);
+            let raw = raw_index_scan_rows(&url, &adapter, "Tiny", &query, 100).await;
+            if !adapter.halfvec {
+                assert_eq!(raw, 100, "a full-precision index stores the tiny rows too");
+                eprintln!("note: no halfvec on this server, so nothing is short — skipping");
+                adapter.close().await.unwrap();
+                return;
+            }
             assert_eq!(
                 raw, 60,
+                "precondition: the fp16 index holds only the 60 ordinary rows"
+            );
+
+            // The true top 100, from the full-precision scores.
+            let expected = {
+                let mut scored: Vec<_> = points
+                    .iter()
+                    .map(|p| {
+                        let dot: f32 = p.vector.iter().zip(&query).map(|(a, b)| a * b).sum();
+                        let norm: f32 = p.vector.iter().map(|a| a * a).sum::<f32>().sqrt();
+                        (p.id, dot / norm)
+                    })
+                    .collect();
+                scored.sort_by(|a, b| b.1.total_cmp(&a.1));
+                scored.truncate(100);
+                scored
+                    .into_iter()
+                    .map(|(id, _)| id)
+                    .collect::<std::collections::HashSet<_>>()
+            };
+            let ids = |hits: &[crate::models::SearchResult]| {
+                hits.iter()
+                    .map(|h| h.id)
+                    .collect::<std::collections::HashSet<_>>()
+            };
+
+            let single = adapter
+                .search_similar("Tiny", "f", &query, 100)
+                .await
+                .unwrap();
+            assert_eq!(single.len(), 100, "the LIMIT must not go silently unmet");
+            assert_eq!(
+                ids(&single),
+                expected,
+                "the fallback must return the true top 100"
+            );
+            assert!(
+                single.windows(2).all(|w| w[0].score >= w[1].score),
+                "rows must be in score order"
+            );
+
+            let other = v8(1.0, 0.5);
+            let zero = vec![0.0; 8];
+            let batched = adapter
+                .batch_search_similar("Tiny", "f", &[query.clone(), zero, other.clone()], 100)
+                .await
+                .unwrap();
+            assert_eq!(batched.len(), 3);
+            assert_eq!(
+                ids(&batched[0]),
+                expected,
+                "batched query 0 falls back like the single one"
+            );
+            assert_eq!(
+                batched[1].len(),
+                60,
+                "a zero-norm query keeps the index's answer (60 NaN-scored rows) — it must \
+                 not fall back to scanning for rows it cannot rank"
+            );
+            assert!(batched[1].iter().all(|h| h.score.is_nan()));
+            let other_single = adapter
+                .search_similar("Tiny", "f", &other, 100)
+                .await
+                .unwrap();
+            assert_eq!(batched[2].len(), 100);
+            assert_eq!(
+                ids(&batched[2]),
+                ids(&other_single),
+                "batched query 2 must get its own exact answer, not query 0's"
+            );
+
+            // A full answer never touches the fallback: the top-50 of the
+            // ordinary rows is all the index needs.
+            let full = adapter
+                .batch_search_similar("Tiny", "f", &[query.clone(), other], 50)
+                .await
+                .unwrap();
+            assert_eq!(full.iter().map(Vec::len).collect::<Vec<_>>(), vec![50, 50]);
+
+            adapter.close().await.unwrap();
+        },
+    )
+    .await;
+}
+
+/// The two deliberate choices `candidate_select_sql` documents for vectors
+/// without a direction, pinned on an index-served collection.
+///
+/// - **Zero-norm query: unchanged, and no exact scan.** It returns what the
+///   index scan returns — up to `top_k` rows, every score `NaN` — exactly as
+///   before the fallback existed, whether that answer is full or short. A
+///   zero-norm query scores every row `NaN`, so falling back could rank
+///   nothing and would only cost a full scan.
+/// - **Zero-norm stored rows: the exact scan's answer.** The cosine index
+///   does not store them, so a short index answer falls back and they come
+///   back last, scored `NaN` — the answer an exact scan (a small collection,
+///   a bulk load, `top_k` above 1000) already gives, so what a search sees
+///   no longer depends on the plan.
+#[tokio::test]
+async fn zero_norm_queries_keep_the_index_answer_and_zero_norm_rows_rank_last() {
+    with_temp_db(
+        "zero_norm_queries_keep_the_index_answer_and_zero_norm_rows_rank_last",
+        |url| async move {
+            let adapter = index_forced_adapter(&url, 8).await;
+            let query = v8(1.0, 0.0);
+            let zero = vec![0.0; 8];
+
+            adapter.create_collection("Mixed", "f", 8).await.unwrap();
+            let points: Vec<_> = (0..150u16)
+                .map(|i| {
+                    let v = if i < 60 {
+                        v8(1.0, f32::from(i) * 0.01)
+                    } else {
+                        zero.clone()
+                    };
+                    crate::models::VectorPoint::new(uuid::Uuid::new_v4(), v)
+                })
+                .collect();
+            adapter.index_points("Mixed", "f", &points).await.unwrap();
+            assert_eq!(
+                raw_index_scan_rows(&url, &adapter, "Mixed", &query, 100).await,
+                60,
                 "precondition: the index holds only the 60 non-zero rows"
             );
 
-            let query = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
             let hits = adapter
-                .search_similar("Zero", "f", &query, 100)
+                .search_similar("Mixed", "f", &query, 100)
                 .await
                 .unwrap();
-            assert_eq!(hits.len(), 100, "the LIMIT must not go silently unmet");
+            assert_eq!(
+                hits.len(),
+                100,
+                "a short index answer is completed by the exact scan"
+            );
             assert!(
                 hits[..60].iter().all(|h| !h.score.is_nan())
                     && hits[60..].iter().all(|h| h.score.is_nan()),
                 "real scores first, then the NaN-scored zero-norm rows"
             );
-            assert!(
-                hits[..60].windows(2).all(|w| w[0].score >= w[1].score),
-                "the real rows must be in score order"
+            assert!(hits[..60].windows(2).all(|w| w[0].score >= w[1].score));
+            let batched = adapter
+                .batch_search_similar("Mixed", "f", std::slice::from_ref(&query), 100)
+                .await
+                .unwrap();
+            assert_eq!(batched[0].len(), 100);
+
+            // Short (60 < 100) and still not completed: the zero-norm query
+            // keeps exactly the index's answer.
+            let raw = raw_index_scan_rows(&url, &adapter, "Mixed", &zero, 100).await;
+            let hits = adapter
+                .search_similar("Mixed", "f", &zero, 100)
+                .await
+                .unwrap();
+            assert_eq!(
+                i64::try_from(hits.len()).unwrap(),
+                raw,
+                "a zero-norm query returns what the index returns, nothing more"
             );
-
-            let (_, batched) = search_counts(&adapter, "Zero", &query, 100).await;
-            assert_eq!(batched, vec![100, 100]);
-
-            // A full answer never touches the fallback: top-50 is all real rows.
-            let (single, batched) = search_counts(&adapter, "Zero", &query, 50).await;
-            assert_eq!((single, batched), (50, vec![50, 50]));
+            assert!(hits.iter().all(|h| h.score.is_nan()));
+            let batched = adapter
+                .batch_search_similar("Mixed", "f", &[zero.clone(), query], 100)
+                .await
+                .unwrap();
+            assert_eq!(
+                (i64::try_from(batched[0].len()).unwrap(), batched[1].len()),
+                (raw, 100),
+                "per query: the zero-norm one keeps the index answer, the other falls back"
+            );
 
             adapter.close().await.unwrap();
         },
