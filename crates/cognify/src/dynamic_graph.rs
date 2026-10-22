@@ -17,11 +17,14 @@ use uuid::Uuid;
 
 use crate::config::ChunkAttachment;
 
-const DATA_POINT_FIELDS: &[&str] = &[
+/// Every field of Python's `DataPoint` (`DataPoint.model_fields`), which a
+/// custom model may not redeclare.
+pub(crate) const DATA_POINT_FIELDS: &[&str] = &[
     "id",
     "created_at",
     "updated_at",
     "ontology_valid",
+    "ontology_uri",
     "version",
     "topological_rank",
     "metadata",
@@ -34,7 +37,6 @@ const DATA_POINT_FIELDS: &[&str] = &[
     "source_content_hash",
     "feedback_weight",
     "importance_weight",
-    "valid_to",
 ];
 
 /// A compiled custom graph model.
