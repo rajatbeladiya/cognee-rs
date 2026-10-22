@@ -22,7 +22,7 @@ impl PyWatcherBridge {
 impl PipelineWatcher for PyWatcherBridge {
     async fn on_pipeline(&self, pipeline_id: Uuid, status: PipelineStatus) {
         let status_str = pipeline_status_to_string(&status);
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             if let Ok(true) = self.inner.bind(py).hasattr("on_pipeline") {
                 let _ = self.inner.call_method1(
                     py,
@@ -42,7 +42,7 @@ impl PipelineWatcher for PyWatcherBridge {
         status: TaskStatus,
     ) {
         let status_str = task_status_to_string(&status);
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             if let Ok(true) = self.inner.bind(py).hasattr("on_task") {
                 let _ = self.inner.call_method1(
                     py,
@@ -60,7 +60,7 @@ impl PipelineWatcher for PyWatcherBridge {
     }
 
     async fn on_pipeline_run_started(&self, run: &PipelineRunInfo) {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             if let Ok(true) = self.inner.bind(py).hasattr("on_run_started") {
                 let _ = self.inner.call_method1(
                     py,
@@ -72,7 +72,7 @@ impl PipelineWatcher for PyWatcherBridge {
     }
 
     async fn on_pipeline_run_completed(&self, run: &PipelineRunInfo, output_count: usize) {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             if let Ok(true) = self.inner.bind(py).hasattr("on_run_completed") {
                 let _ = self.inner.call_method1(
                     py,
@@ -84,7 +84,7 @@ impl PipelineWatcher for PyWatcherBridge {
     }
 
     async fn on_pipeline_run_errored(&self, run: &PipelineRunInfo, error: &str) {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             if let Ok(true) = self.inner.bind(py).hasattr("on_run_errored") {
                 let _ = self.inner.call_method1(
                     py,
@@ -96,7 +96,7 @@ impl PipelineWatcher for PyWatcherBridge {
     }
 
     async fn on_task_started(&self, run: &PipelineRunInfo, task_name: &str, task_index: usize) {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             if let Ok(true) = self.inner.bind(py).hasattr("on_task_started") {
                 let _ = self.inner.call_method1(
                     py,
@@ -108,7 +108,7 @@ impl PipelineWatcher for PyWatcherBridge {
     }
 
     async fn on_task_completed(&self, run: &PipelineRunInfo, task_name: &str, output_count: usize) {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             if let Ok(true) = self.inner.bind(py).hasattr("on_task_completed") {
                 let _ = self.inner.call_method1(
                     py,
@@ -120,7 +120,7 @@ impl PipelineWatcher for PyWatcherBridge {
     }
 
     async fn on_task_errored(&self, run: &PipelineRunInfo, task_name: &str, error: &str) {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             if let Ok(true) = self.inner.bind(py).hasattr("on_task_errored") {
                 let _ = self.inner.call_method1(
                     py,
