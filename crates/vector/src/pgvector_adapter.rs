@@ -1475,14 +1475,15 @@ impl PgVectorAdapter {
             o.options([
                 ("hnsw.ef_search", HNSW_EF_SEARCH_SESSION.to_string()),
                 // pgvector 0.8+: when the beam runs dry before the LIMIT —
-                // dead tuples after deletes, or a degenerate graph over
-                // near-identical vectors (the `a_search_returns_top_k_rows…`
-                // test: 33 of 100 rows at ef_search = 200 with the scan off
-                // *and* with `strict_order`) — keep scanning instead of
-                // silently returning fewer rows. `relaxed_order` may emit
-                // rows slightly out of distance order, so the searches
-                // re-sort their (at most `top_k`) rows. Older pgvector
-                // ignores the unknown placeholder setting.
+                // dead tuples after deletes, a beam filled with near-identical
+                // vectors — keep scanning instead of silently returning fewer
+                // rows. `relaxed_order` may emit rows slightly out of distance
+                // order, so the searches re-sort their (at most `top_k`)
+                // rows. Older pgvector ignores the unknown placeholder
+                // setting. This is the cheap first line, not the guarantee:
+                // a query trapped in a closed component of the graph has
+                // nothing to resume from, and that case is caught by the
+                // exact fallback in `candidate_select_sql`.
                 ("hnsw.iterative_scan", "relaxed_order".to_string()),
                 // Custom plans: sqlx caches each prepared statement per
                 // connection, and a generic plan cannot see the NodeSet
@@ -2263,10 +2264,10 @@ impl PgVectorAdapter {
     ///
     /// - `hnsw.iterative_scan = relaxed_order`: without it an HNSW scan that
     ///   runs its beam dry before the `LIMIT` — dead tuples after deletes, or a
-    ///   degenerate graph over near-identical vectors — returns *fewer* than
-    ///   `top_k` rows and says nothing. Raising `ef_search` does not fix that
-    ///   case; `a_search_returns_top_k_rows_even_above_the_default_ef_search`
-    ///   measured 33 of 100 rows at `ef_search = 200` without it.
+    ///   beam crowded with near-identical vectors — returns *fewer* than
+    ///   `top_k` rows and says nothing, and the search then pays for the exact
+    ///   fallback of [`Self::candidate_select_sql`] where resuming the scan
+    ///   would have been enough.
     /// - `plan_cache_mode = force_custom_plan`: a generic plan cannot see the
     ///   `NodeSet` array of [`VectorDB::search_similar_filtered`], costs the GIN
     ///   prefilter blind and falls back to scanning every wide chunk row — 40 ms
@@ -2399,6 +2400,85 @@ impl PgVectorAdapter {
     /// silently stop using its index.
     const fn is_indexable_dimension(dim: usize) -> bool {
         dim <= MAX_INDEXABLE_DIMENSION
+    }
+
+    /// Whether an ANN search over `dim`-dimensional vectors at `top_k` may be
+    /// answered by an HNSW index scan — i.e. is *approximate*, and so may come
+    /// back short (see [`Self::candidate_select_sql`]). False exactly where
+    /// [`Self::ann_search_locals`] / [`Self::candidate_order_expr`] already
+    /// declare the scan exact.
+    const fn ann_scan_is_approximate(dim: usize, top_k: usize, indexless: bool) -> bool {
+        !indexless && Self::is_indexable_dimension(dim) && top_k <= HNSW_EF_SEARCH_MAX
+    }
+
+    /// The candidate rows of one similarity search: `(id, score, metadata)` for
+    /// at most `limit` rows of `coll` nearest `query` (a vector-typed SQL
+    /// expression — `$1::vector`, or the LATERAL `q.vec`) by `order`. The
+    /// caller re-sorts them.
+    ///
+    /// With `guard_short`, an index scan that returns **fewer than `limit`
+    /// rows** is thrown away and the same `limit` is answered by the exact
+    /// scan instead, inside the same statement. An HNSW scan can come back
+    /// short however wide `hnsw.ef_search` is and with `hnsw.iterative_scan`
+    /// on, because it can only return elements reachable from the entry point,
+    /// and the graph over near-duplicate vectors is not always connected:
+    /// candidates at a cosine distance that rounds to exactly 0 fill each
+    /// other's neighbour lists and can close into a component with no edge
+    /// out. A query that descends into one is trapped there — measured on
+    /// pgvector 0.8.7, 5 000 clustered 8-d rows, top-100: 49 rows (an element
+    /// and its `2 * m = 48` layer-0 neighbours) at **every** `ef_search` from
+    /// 40 to 1 000, with the iterative scan off, `strict_order` and
+    /// `relaxed_order`, and with `hnsw.max_scan_tuples` raised to 1M. The
+    /// iterative scan cannot help: it resumes from candidates the first pass
+    /// *discarded*, and a closed component that fits in the beam discards
+    /// nothing. Whether the graph closes such a component depends on the
+    /// random element levels and on how concurrent inserts interleave, which
+    /// is why this surfaced as a CI failure on one runner image and not
+    /// another.
+    ///
+    /// Short is the only signal that is both cheap and sound: when the
+    /// collection really holds fewer than `limit` rows the exact scan is over
+    /// fewer than `limit` rows, and otherwise a short answer is wrong by
+    /// definition. The fallback is gated on an `InitPlan`, which Postgres runs
+    /// as a one-time filter, so on a full answer the sequential scan is never
+    /// started (EXPLAIN ANALYZE: `Seq Scan … (never executed)`) and the
+    /// healthy path costs one materialised `count(*)` over at most `limit`
+    /// rows. It catches every other way the index can answer short too — dead
+    /// tuples past `hnsw.max_scan_tuples`, or zero-norm vectors, which the
+    /// cosine index does not store — and the answer it gives is exactly the
+    /// one the exact paths (an indexless bulk load, `top_k` above
+    /// [`HNSW_EF_SEARCH_MAX`]) give.
+    ///
+    /// The fallback orders by the score expression rather than `vector <=>
+    /// query`, so that no HNSW index — the fp16 one or a legacy
+    /// `vector_cosine_ops` one — can match it whatever the session settings
+    /// are: it is exact by construction. `{NAN_LAST}, score DESC` sorts real
+    /// scores, then `NaN` (zero-norm rows), then `NULL`, which is the order the
+    /// ascending distance of the exact path gives.
+    ///
+    /// Without `guard_short` (an exact scan already) this is the plain
+    /// `ORDER BY … LIMIT`, and the exact branch would only scan the table a
+    /// second time.
+    fn candidate_select_sql(
+        coll: &str,
+        query: &str,
+        order: &str,
+        limit: i64,
+        guard_short: bool,
+    ) -> String {
+        let scored =
+            format!(r#"SELECT id, 1 - (vector <=> {query}) AS score, metadata FROM "{coll}""#);
+        if !guard_short {
+            return format!("{scored} ORDER BY {order} LIMIT {limit}");
+        }
+        format!(
+            r#"WITH ann AS MATERIALIZED ({scored} ORDER BY {order} LIMIT {limit}),
+                    short AS (SELECT count(*) < {limit} AS s FROM ann)
+               SELECT id, score, metadata FROM ann WHERE NOT (SELECT s FROM short)
+               UNION ALL
+               (SELECT id, score, metadata FROM ({scored} WHERE (SELECT s FROM short)) e
+                 ORDER BY {NAN_LAST}, score DESC LIMIT {limit})"#
+        )
     }
 
     /// `SET LOCAL` statements that force an exact scan, for the paths whose
@@ -3666,12 +3746,15 @@ impl VectorDB for PgVectorAdapter {
         // right now, and two reads of the mutex could straddle a `DROP INDEX`.
         let indexless = self.is_deferred(&coll);
         let order = Self::candidate_order_expr("$1", dim, top_k, self.halfvec, indexless);
+        let candidates = Self::candidate_select_sql(
+            &coll,
+            "$1::vector",
+            &order,
+            limit,
+            Self::ann_scan_is_approximate(dim, top_k, indexless),
+        );
         let sql = format!(
-            r#"SELECT id, score, metadata FROM (
-                 SELECT id, 1 - (vector <=> $1::vector) AS score, metadata
-                 FROM "{coll}"
-                 ORDER BY {order}
-                 LIMIT {limit}) r
+            r#"SELECT id, score, metadata FROM ({candidates}) r
                ORDER BY {NAN_LAST}, score DESC"#
         );
 
@@ -3901,16 +3984,20 @@ impl VectorDB for PgVectorAdapter {
         // agree about whether the index is there.
         let indexless = self.is_deferred(&coll);
         let order = Self::candidate_order_expr("q.vec", dim, top_k, self.halfvec, indexless);
+        // Per query, so one query trapped in a closed corner of the HNSW
+        // graph falls back to the exact scan without dragging the others.
+        let candidates = Self::candidate_select_sql(
+            &coll,
+            "q.vec",
+            &order,
+            i64::try_from(top_k).unwrap_or(i64::MAX),
+            Self::ann_scan_is_approximate(dim, top_k, indexless),
+        );
 
         let sql = format!(
             r#"SELECT q.idx AS idx, t.id AS id, t.score AS score, t.metadata AS metadata
                FROM unnest(ARRAY[{array_literal}]) WITH ORDINALITY AS q(vec, idx)
-               CROSS JOIN LATERAL (
-                   SELECT id, 1 - (vector <=> q.vec) AS score, metadata
-                   FROM "{coll}"
-                   ORDER BY {order}
-                   LIMIT {top_k}
-               ) t
+               CROSS JOIN LATERAL ({candidates}) t
                ORDER BY q.idx, (t.score = 'NaN'::float8), t.score DESC"#
         );
 

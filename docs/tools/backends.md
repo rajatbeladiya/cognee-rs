@@ -36,7 +36,14 @@ Notes:
   HNSW scan returns at most `ef_search` rows, default 40, and then stops — a
   larger `LIMIT` is otherwise silently unmet) and runs with
   `hnsw.iterative_scan = relaxed_order`, which keeps scanning until the `LIMIT`
-  is met over dead tuples and tightly clustered vectors.
+  is met over dead tuples and tightly clustered vectors. Neither is a guarantee:
+  over near-duplicate vectors the HNSW graph can close into a component with no
+  edge out, and a query that descends into one gets only that component's rows
+  at any `ef_search` (49 of 100 measured). So an index scan that returns fewer
+  than `top_k` rows is discarded and the search is answered by the exact scan
+  instead, in the same statement — a `LIMIT` is never silently unmet while the
+  collection holds that many rows. On a full answer the exact branch is never
+  started.
   **Two pgvector version floors, both probed.** `hnsw.iterative_scan` needs
   pgvector 0.8+. On a pool the adapter opens itself it is a connection *option*,
   applied before any extension library loads, so an older server turns it into a

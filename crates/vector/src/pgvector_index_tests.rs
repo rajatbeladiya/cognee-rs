@@ -260,6 +260,13 @@ async fn backfill_replaces_an_invalid_index_left_by_a_failed_build() {
 /// The vectors here are tightly clustered on purpose. With uniformly random
 /// vectors the scan happens to return the full 100 and the bug hides; real
 /// embeddings cluster, which is when it bites.
+///
+/// The clustering also puts ~245 of the rows at a cosine distance that rounds
+/// to exactly 0 from the query, which is enough for the HNSW graph to close a
+/// component around them now and then (about 1 run in 20 here, and on an
+/// ubuntu-26.04 CI runner): the scan then returns 49 rows at any `ef_search`.
+/// The adapter's exact fallback covers that; the case pinned deterministically
+/// is `a_search_trapped_in_a_closed_hnsw_component_still_returns_top_k`.
 #[tokio::test]
 async fn a_search_returns_top_k_rows_even_above_the_default_ef_search() {
     with_temp_db(
@@ -290,8 +297,10 @@ async fn a_search_returns_top_k_rows_even_above_the_default_ef_search() {
             assert_eq!(
                 hits.len(),
                 100,
-                "top_k=100 must return 100 rows; {} means the HNSW scan stopped at \
-                 hnsw.ef_search and the LIMIT went silently unmet",
+                "top_k=100 must return 100 rows; {} means the HNSW scan came back short — \
+                 capped at hnsw.ef_search, or trapped in a closed graph component (see \
+                 a_search_trapped_in_a_closed_hnsw_component_still_returns_top_k) — and \
+                 the LIMIT went silently unmet",
                 hits.len()
             );
 
@@ -310,6 +319,192 @@ async fn a_search_returns_top_k_rows_even_above_the_default_ef_search() {
                     bucket.len()
                 );
             }
+
+            adapter.close().await.unwrap();
+        },
+    )
+    .await;
+}
+
+/// A pgvector adapter over a caller-owned pool whose connections refuse the
+/// sequential scan wherever another plan exists (`enable_seqscan = off`), so
+/// that a search over a collection of a few hundred rows is still answered by
+/// the HNSW index. Without it the planner — rightly — scans a table that small,
+/// the index is never asked, and the cases below would pass for the wrong
+/// reason. The exact fallback still runs: with no index able to serve its
+/// ordering, the sequential scan is the only plan it has.
+async fn index_forced_adapter(url: &str, dimension: usize) -> PgVectorAdapter {
+    let mut opts = sea_orm::ConnectOptions::new(url.to_string());
+    opts.map_sqlx_postgres_opts(|o| o.options([("enable_seqscan", "off")]));
+    let db = Database::connect(opts).await.unwrap();
+    PgVectorAdapter::from_connection(db, dimension)
+        .await
+        .unwrap()
+}
+
+/// The search and the batched search, both asked for `top_k` against `query`,
+/// with the row counts each returned.
+async fn search_counts(
+    adapter: &PgVectorAdapter,
+    coll: &str,
+    query: &[f32],
+    top_k: usize,
+) -> (usize, Vec<usize>) {
+    let single = adapter
+        .search_similar(coll, "f", query, top_k)
+        .await
+        .unwrap();
+    let batched = adapter
+        .batch_search_similar(coll, "f", &[query.to_vec(), query.to_vec()], top_k)
+        .await
+        .unwrap();
+    (single.len(), batched.iter().map(Vec::len).collect())
+}
+
+/// How many rows the HNSW index scan alone returns for `query`, at the widest
+/// `ef_search` pgvector accepts and with the iterative scan on: what the search
+/// would answer without its exact fallback.
+async fn raw_index_scan_rows(url: &str, coll: &str, query: &str, top_k: usize) -> i64 {
+    let db = Database::connect(url).await.unwrap();
+    let txn = sea_orm::TransactionTrait::begin(&db).await.unwrap();
+    txn.execute_unprepared(
+        "SET LOCAL enable_seqscan = off; SET LOCAL hnsw.ef_search = 1000; \
+         SET LOCAL hnsw.iterative_scan = relaxed_order",
+    )
+    .await
+    .unwrap();
+    let row = txn
+        .query_one(Statement::from_string(
+            DatabaseBackend::Postgres,
+            format!(
+                r#"SELECT count(*) AS n FROM (SELECT id FROM "{coll}_f"
+                     ORDER BY vector::halfvec(8) <=> '{query}'::halfvec(8)
+                     LIMIT {top_k}) s"#
+            ),
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    txn.commit().await.unwrap();
+    row.try_get::<i64>("", "n").unwrap()
+}
+
+/// The mechanism behind the CI failure of
+/// `a_search_returns_top_k_rows_even_above_the_default_ef_search` (49 of 100
+/// rows on an ubuntu-26.04 runner), made reproducible on any machine.
+///
+/// 1 000 vectors `[1, i·6e-8, 0, …]` are distinct in fp16 — so pgvector does
+/// not fold them into one element's heap-TID list — but every pair, and every
+/// one against the query, sits at a cosine distance that rounds to exactly 0 in
+/// `f32`. Built in one batch (the rebuild path, so a `CREATE INDEX`), their
+/// layer-0 neighbour lists fill with each other and close into components of
+/// ~50 elements with no edge out. The query descends into one and is trapped:
+/// the raw index scan returns 49-73 rows here on every run measured (40 of 40),
+/// at any `ef_search` and with the iterative scan on, because the scan resumes
+/// only from candidates it discarded and a component smaller than the beam
+/// discards none. The adapter has to notice the short answer and fall back to
+/// the exact scan.
+///
+/// The raw scan's count is asserted to be short as well, so that if a pgvector
+/// release ever stops closing these components the case says so instead of
+/// silently passing without exercising the fallback.
+#[tokio::test]
+async fn a_search_trapped_in_a_closed_hnsw_component_still_returns_top_k() {
+    with_temp_db(
+        "a_search_trapped_in_a_closed_hnsw_component_still_returns_top_k",
+        |url| async move {
+            let adapter = index_forced_adapter(&url, 8).await;
+            adapter.create_collection("Trap", "f", 8).await.unwrap();
+            let points: Vec<_> = (0..1000u16)
+                .map(|i| {
+                    let v = vec![1.0, f32::from(i) * 6e-8, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+                    crate::models::VectorPoint::new(uuid::Uuid::new_v4(), v)
+                })
+                .collect();
+            adapter.index_points("Trap", "f", &points).await.unwrap();
+
+            let raw = raw_index_scan_rows(&url, "Trap", "[1,0,0,0,0,0,0,0]", 100).await;
+            assert!(
+                raw < 100,
+                "precondition: the HNSW scan alone must come back short here ({raw} rows) \
+                 for this case to exercise the exact fallback"
+            );
+
+            let query = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+            let (single, batched) = search_counts(&adapter, "Trap", &query, 100).await;
+            assert_eq!(
+                single, 100,
+                "the index scan returned {raw} rows; the search must fall back to the exact \
+                 scan rather than return {single}"
+            );
+            assert_eq!(
+                batched,
+                vec![100, 100],
+                "every batched query needs the same fallback"
+            );
+
+            adapter.close().await.unwrap();
+        },
+    )
+    .await;
+}
+
+/// The fallback is keyed on the answer coming back short, not on the graph, so
+/// it covers every way an index scan can miss rows that exist. This one is
+/// deterministic: the cosine HNSW index does not store zero-norm vectors at
+/// all, so with 60 real rows and 90 all-zero ones the index can return at most
+/// 60 of a top-100.
+///
+/// The answer must be the exact scan's — the one an indexless collection (a
+/// bulk load) or a `top_k` above 1000 already gives: the 60 real rows first in
+/// score order, then 40 zero-norm rows with a `NaN` score.
+#[tokio::test]
+async fn a_search_the_index_cannot_fill_is_answered_by_the_exact_scan() {
+    with_temp_db(
+        "a_search_the_index_cannot_fill_is_answered_by_the_exact_scan",
+        |url| async move {
+            let adapter = index_forced_adapter(&url, 8).await;
+            adapter.create_collection("Zero", "f", 8).await.unwrap();
+            let points: Vec<_> = (0..150u16)
+                .map(|i| {
+                    let v = if i < 60 {
+                        vec![1.0, f32::from(i) * 0.01, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+                    } else {
+                        vec![0.0; 8]
+                    };
+                    crate::models::VectorPoint::new(uuid::Uuid::new_v4(), v)
+                })
+                .collect();
+            adapter.index_points("Zero", "f", &points).await.unwrap();
+
+            let raw = raw_index_scan_rows(&url, "Zero", "[1,0,0,0,0,0,0,0]", 100).await;
+            assert_eq!(
+                raw, 60,
+                "precondition: the index holds only the 60 non-zero rows"
+            );
+
+            let query = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+            let hits = adapter
+                .search_similar("Zero", "f", &query, 100)
+                .await
+                .unwrap();
+            assert_eq!(hits.len(), 100, "the LIMIT must not go silently unmet");
+            assert!(
+                hits[..60].iter().all(|h| !h.score.is_nan())
+                    && hits[60..].iter().all(|h| h.score.is_nan()),
+                "real scores first, then the NaN-scored zero-norm rows"
+            );
+            assert!(
+                hits[..60].windows(2).all(|w| w[0].score >= w[1].score),
+                "the real rows must be in score order"
+            );
+
+            let (_, batched) = search_counts(&adapter, "Zero", &query, 100).await;
+            assert_eq!(batched, vec![100, 100]);
+
+            // A full answer never touches the fallback: top-50 is all real rows.
+            let (single, batched) = search_counts(&adapter, "Zero", &query, 50).await;
+            assert_eq!((single, batched), (50, vec![50, 50]));
 
             adapter.close().await.unwrap();
         },
