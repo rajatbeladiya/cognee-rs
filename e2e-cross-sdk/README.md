@@ -14,7 +14,8 @@ SDKs by driving both CLIs and comparing the databases they produce.
 ## Architecture
 
 A multi-stage Dockerfile packages the Rust `cognee-cli` release binary (built
-on the runner, copied in from `cognee-rust/dist/`), a Python cognee venv and
+on the runner inside the Dockerfile's `rust-build-env` stage — the harness's
+own base image — and copied in from `cognee-rust/dist/`), a Python cognee venv and
 this pytest harness into one image. Each test shells out to both CLIs in
 isolated tmpfs workspaces and compares the resulting SQLite state.
 
@@ -28,6 +29,10 @@ touch ../.env                         # stub required by docker-compose env_file
 #   cargo build --release -p cognee-cli -p cognee-telemetry-emit
 #   mkdir -p dist && cp target/release/cognee-cli \
 #     target/release/cognee-telemetry-emit dist/
+# A host build only runs in the image if the host's glibc is no newer than
+# the harness's (Debian Trixie, 2.41). Otherwise build inside the
+# `rust-build-env` stage as CI does — the Dockerfile's stage-1 note has the
+# exact commands.
 
 # Telemetry parity (no LLM):
 docker compose -f docker-compose.yml run --rm e2e-telemetry
