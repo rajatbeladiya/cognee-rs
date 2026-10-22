@@ -81,7 +81,12 @@ policy: every node gets a random id, nothing is vector-indexed and nothing is
 transparent. Python's own round trip produces the same result, so Rust compiles
 it the same way rather than rejecting it. An unprocessed
 `DataPoint.model_json_schema()` is rejected, because it declares the reserved
-DataPoint infrastructure fields.
+DataPoint infrastructure fields: the keys a stored node's base carries (`id`,
+`type`, `version`, `metadata`, the timestamps, the `source_*` provenance
+fields, ...), which a custom property would overwrite. Python is laxer here:
+its generated subclass may redeclare any `DataPoint` field. The two Python
+`DataPoint` fields the Rust base does not carry, `ontology_uri` and the
+removed `valid_to`, are ordinary custom fields, as in Python.
 
 Local `$defs` and `#/$defs/...` references are supported, whether a field holds
 one model, an optional model, a union of models, or a list of any of these;

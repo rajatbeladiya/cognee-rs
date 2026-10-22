@@ -260,6 +260,10 @@ fn default_true() -> bool {
     true
 }
 
+fn malformed(error: serde_json::Error) -> GraphSpecError {
+    GraphSpecError::Malformed(error.to_string())
+}
+
 /// A boolean the way Pydantic's lax mode reads one: a JSON boolean, `0`/`1`
 /// (integer or float), or one of the strings Pydantic accepts, any case.
 fn lax_bool<'de, D: Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
@@ -308,8 +312,7 @@ impl GraphSchemaSpec {
     /// [`GraphSpecError::Malformed`] when the value does not have the spec's
     /// shape, or any validation error of [`GraphSchemaSpec::validate`].
     pub fn from_value(value: &Value) -> Result<Self, GraphSpecError> {
-        let spec = Self::deserialize(value)
-            .map_err(|error| GraphSpecError::Malformed(error.to_string()))?;
+        let spec = Self::parse(value)?;
         spec.validate()?;
         Ok(spec)
     }
@@ -319,10 +322,18 @@ impl GraphSchemaSpec {
     /// # Errors
     /// As [`GraphSchemaSpec::from_value`].
     pub fn from_json(json: &str) -> Result<Self, GraphSpecError> {
-        let spec: Self = serde_json::from_str(json)
-            .map_err(|error| GraphSpecError::Malformed(error.to_string()))?;
+        let spec: Self = serde_json::from_str(json).map_err(malformed)?;
         spec.validate()?;
         Ok(spec)
+    }
+
+    /// Deserialize a spec object, or a string holding one, without validating
+    /// it.
+    fn parse(value: &Value) -> Result<Self, GraphSpecError> {
+        match value {
+            Value::String(text) => serde_json::from_str(text).map_err(malformed),
+            other => Self::deserialize(other).map_err(malformed),
+        }
     }
 
     /// The entity compiled as the top-level model: `root`, else the first.
@@ -495,10 +506,12 @@ fn is_identifier(name: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-/// Python's `RESERVED_FIELD_NAMES`: every `DataPoint` field plus the
-/// generated type-marker field.
+/// Python's `RESERVED_FIELD_NAMES`: every field of Python's `DataPoint` plus
+/// the generated type-marker field. That is the stored base's keys plus
+/// `ontology_uri`, a Python `DataPoint` field the Rust base does not carry
+/// (and which a hand-written `graph_schema` may therefore declare).
 fn is_reserved_field_name(name: &str) -> bool {
-    name == TYPE_MARKER_FIELD || DATA_POINT_FIELDS.contains(&name)
+    matches!(name, TYPE_MARKER_FIELD | "ontology_uri") || DATA_POINT_FIELDS.contains(&name)
 }
 
 /// Compile a spec into the graph-model JSON Schema that
@@ -516,18 +529,24 @@ fn is_reserved_field_name(name: &str) -> bool {
 /// Any [`GraphSchemaSpec::validate`] error; the spec is validated first.
 pub fn graph_spec_to_json_schema(spec: &GraphSchemaSpec) -> Result<Value, GraphSpecError> {
     spec.validate()?;
+    Ok(compile_validated(spec))
+}
+
+/// [`graph_spec_to_json_schema`] for a spec that passed
+/// [`GraphSchemaSpec::validate`].
+fn compile_validated(spec: &GraphSchemaSpec) -> Value {
     let mut defs = Map::new();
     for entity in &spec.entities {
         defs.insert(format!("{}Type", entity.name), entity_type_def(entity));
         defs.insert(entity.name.clone(), Value::Object(entity_schema(entity)));
     }
-    let root = spec
-        .root_entity()
-        .ok_or_else(|| GraphSpecError::UnknownRoot(spec.root.clone().unwrap_or_default()))?;
     let mut schema = Map::new();
     schema.insert("$defs".to_string(), Value::Object(defs));
-    schema.extend(entity_schema(root));
-    Ok(Value::Object(schema))
+    // `validate` guarantees a root: a declared `root` or a first entity.
+    if let Some(root) = spec.root_entity() {
+        schema.extend(entity_schema(root));
+    }
+    Value::Object(schema)
 }
 
 /// Validate a spec, compile it, and compile the result into the runtime
@@ -550,11 +569,7 @@ pub fn graph_model_from_spec(spec: &GraphSchemaSpec) -> Result<DynamicGraphSchem
 /// [`GraphSpecError::Malformed`] for a string that is not JSON or a value
 /// that is not a spec, and any validation error.
 pub fn graph_schema_from_spec_value(value: &Value) -> Result<Value, GraphSpecError> {
-    let spec = match value {
-        Value::String(text) => GraphSchemaSpec::from_json(text)?,
-        other => GraphSchemaSpec::from_value(other)?,
-    };
-    graph_spec_to_json_schema(&spec)
+    graph_spec_to_json_schema(&GraphSchemaSpec::parse(value)?)
 }
 
 fn index_fields(entity: &EntitySpec) -> Vec<String> {
@@ -837,5 +852,8 @@ mod tests {
         }
         // Dropped from Python's DataPoint in SDK-880.
         assert!(!is_reserved_field_name("valid_to"));
+        // Reserved for a spec, as in Python, though a hand-written
+        // `graph_schema` may declare it (the Rust base does not carry it).
+        assert!(!DATA_POINT_FIELDS.contains(&"ontology_uri"));
     }
 }
