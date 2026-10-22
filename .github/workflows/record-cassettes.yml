@@ -37,7 +37,7 @@ env:
 jobs:
   record:
     name: Record cassettes
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # contents:write lets the default GITHUB_TOKEN commit the refreshed cassettes
     # (they are not workflow files, so no `workflow` scope is needed).
     permissions:

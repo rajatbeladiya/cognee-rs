@@ -82,10 +82,15 @@ env:
   CCACHE_COMPILERCHECK: content
 
 jobs:
+  # Every Linux job pins ubuntu-24.04 rather than ubuntu-latest. On 2026-10-22
+  # ubuntu-latest became ubuntu-26.04, which ships Python 3.14 (newer than
+  # PyO3 0.23 supports) and glibc 2.43 (binaries built on it no longer run in
+  # the Debian e2e harness image). Move off 24.04 deliberately, in one PR that
+  # also touches community.yml, http-parity.yml and the prebuild workflows.
   # ── Stage 1: Quick lints (fast fail) ──────────────────────────────────
   lint:
     name: Lint (fmt + check + clippy)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # In-repo only: fork PRs get no secrets and are covered by the
     # `Community Checks (No Secrets)` workflow. `test`, the Postgres lanes and
     # the binding-check jobs cascade off this gate via `needs`.
@@ -371,7 +376,7 @@ jobs:
   # path, so this only manifests on x86_64.
   msrv:
     name: MSRV (1.91.1)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # In-repo only (no `needs`, so it carries its own gate). See `lint`.
     if: >-
       github.event_name != 'pull_request' ||
@@ -445,7 +450,7 @@ jobs:
   # No protoc/cmake/lbug here: the three logic crates pull none of them.
   wasm:
     name: wasm32 (Config-1 logic crates)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # In-repo only (no `needs`, so it carries its own gate). See `lint`. Needs no
     # secrets itself, but it belongs to the keyed workflow that fork PRs skip
     # wholesale — the fork-safe `Community Checks` workflow covers forks instead.
@@ -527,7 +532,7 @@ jobs:
   test:
     name: Test (stable)
     needs: lint
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     env:
       OPENAI_URL: https://api.openai.com/v1
@@ -679,7 +684,7 @@ jobs:
   docs-and-extras:
     name: Docs + feature lanes
     needs: lint
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Checkout
@@ -834,7 +839,7 @@ jobs:
   pgvector-postgres:
     name: Test (Postgres pgvector lane)
     needs: lint
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     services:
       postgres:
@@ -1016,7 +1021,7 @@ jobs:
   pg-single-db-postgres:
     name: Test (Postgres single-database lane)
     needs: lint
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     services:
       postgres:
@@ -1189,7 +1194,7 @@ jobs:
   pggraph-postgres:
     name: Test (Postgres graph lane)
     needs: lint
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     services:
       postgres:
@@ -1331,7 +1336,7 @@ jobs:
   redis-session:
     name: Test (Redis session lane)
     needs: lint
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     services:
       redis:
@@ -1407,7 +1412,7 @@ jobs:
   capi-check:
     name: C API Check
     needs: lint
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     env:
       OPENAI_URL: https://api.openai.com/v1
@@ -1499,7 +1504,7 @@ jobs:
   python-check:
     name: Python Bindings Check
     needs: lint
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
       - uses: actions/checkout@v4
@@ -1579,7 +1584,7 @@ jobs:
   ts-check:
     name: JS/TS Bindings Check
     needs: lint
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
       - uses: actions/checkout@v4
@@ -1636,7 +1641,7 @@ jobs:
   java-check:
     name: Java Bindings Check
     needs: lint
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
       - uses: actions/checkout@v4
@@ -1695,7 +1700,7 @@ jobs:
   notify:
     name: Test Suite Status
     needs: [ lint, msrv, wasm, test, docs-and-extras, pgvector-postgres, pg-single-db-postgres, pggraph-postgres, redis-session, capi-check, python-check, ts-check, java-check ]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     if: >-
       !cancelled() &&
       (github.event_name != 'pull_request' ||
