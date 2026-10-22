@@ -334,7 +334,14 @@ schema is compiled, so a violation fails before any LLM call (as
   so the target can be built from the identity string alone.
 - **Marker value:** the keyword takes `true` or `false`. It may sit on the
   field or inside it, such as on the `anyOf` variant, as Python finds a marker
-  at any depth.
+  at any depth. The keyword is removed from the schema sent to the LLM in
+  every case, `false` included, so a strict structured-output request never
+  sees it.
+
+Python does not check that the target's identity field is one of its declared
+fields, and neither does Rust. When it is not, every reference gets a random
+id and so becomes a node of its own; the compile step logs a warning that the
+identity has no stable value.
 
 In the schema sent to the LLM the field becomes `string`, `string` or `null`,
 or an array of `string`. Its `default` and `title` are kept, and its
@@ -343,10 +350,16 @@ already in the graph"`. An answered object is still accepted as the nested
 model, as Python leaves a non-string answer untouched.
 
 A reference becomes a node holding only the identity value and the target's
-defaults. Within one storage batch the first occurrence of an id wins (see
-above), so a full answer reached earlier keeps its properties. A reference
-stored in a later batch is written over the existing node with those defaults,
-as Python's adapters upsert it.
+defaults, which has two consequences, both as in Python:
+
+- **Within one storage batch the first occurrence of an id wins** (see above),
+  and the walk follows the models' field *declaration* order, not the
+  answer's key order. Declare the field that lists targets in full before the
+  fields that reference them, or the reference-only node is the one stored.
+- **A reference stored in a later batch replaces the stored node's
+  properties** with those defaults: both Python's and Rust's Ladybug adapters
+  overwrite the whole property blob on `MERGE ... ON MATCH SET`. A reference
+  resolves to the right node but resets its other fields.
 
 ### Spec DSL
 

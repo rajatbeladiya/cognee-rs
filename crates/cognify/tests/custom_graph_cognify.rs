@@ -679,3 +679,49 @@ async fn an_invalid_from_identity_reference_fails_before_any_llm_call() {
     );
     assert!(llm.system_prompts().is_empty(), "no LLM call was made");
 }
+
+/// A reference stored in a later run is written over the node an earlier run
+/// stored, with the target's defaults: Python's Ladybug adapter replaces the
+/// whole `properties` blob on `MERGE ... ON MATCH SET`
+/// (`ladybug/adapter.py` `add_nodes`), and so does Rust's. Pinned so a change
+/// to these semantics is a deliberate one.
+#[tokio::test]
+async fn a_later_reference_overwrites_the_stored_node_as_in_python() {
+    let schema = directory_schema(json!({
+        "anyOf": [{"$ref": "#/$defs/Company"}, {"type": "null"}],
+        "default": null,
+        "x-cognee-from-identity": true
+    }));
+    let config = extraction_config().with_graph_schema(schema);
+    let mut harness = Harness::new().await;
+    let first = harness.add_file(PLAIN_TEXT).await;
+    let second = harness.add_file(DATED_TEXT).await;
+    let acme = node_id("Company", "Acme").to_string();
+
+    let full = json!({"companies": [{"name": "Acme", "founded": 1999}], "people": []});
+    harness
+        .run_over(&config, &[first], SchemaKeyedLlm::new(full))
+        .await
+        .expect("first run");
+    assert_eq!(
+        Stored::of(&harness).await.nodes[&acme].get("founded"),
+        Some(&json!(1999))
+    );
+
+    let reference = json!({"companies": [], "people": [{"name": "Alice", "employer": "Acme"}]});
+    harness
+        .run_over(&config, &[second], SchemaKeyedLlm::new(reference))
+        .await
+        .expect("second run");
+    let stored = Stored::of(&harness).await;
+    assert_eq!(
+        stored.field_edges("employer"),
+        BTreeSet::from([(node_id("Person", "Alice").to_string(), acme.clone())]),
+        "the reference resolves to the stored node"
+    );
+    assert_eq!(
+        stored.nodes[&acme].get("founded"),
+        Some(&json!(0)),
+        "the reference's defaults replace the stored properties"
+    );
+}

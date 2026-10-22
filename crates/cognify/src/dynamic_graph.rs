@@ -616,6 +616,9 @@ impl DynamicGraphSchema {
             root_definition.is_none(),
             &mut llm_schema,
         )?;
+        // A `false` marker, or one the narrowing did not replace, must not
+        // reach a strict structured-output request either.
+        strip_from_identity_marker(&mut llm_schema);
 
         Ok(Self {
             root,
@@ -868,12 +871,6 @@ fn identity_reference_shape(schema: &Value) -> Option<IdentityReferenceShape<'_>
     })
 }
 
-/// Python's list `repr` of a list of strings.
-fn python_str_list_repr(items: &[String]) -> String {
-    let items: Vec<String> = items.iter().map(|item| python_str_repr(item)).collect();
-    format!("[{}]", items.join(", "))
-}
-
 /// Check every FromIdentity field the way Python's `_llm_identity_field_for`
 /// does, record the target's identity field on it, and narrow it in the LLM
 /// schema to the identity string(s) the LLM should answer.
@@ -912,16 +909,16 @@ fn resolve_identity_references(
             let target_model = &models[target];
             let identity = &target_model.identity_fields;
             if identity.len() != 1 {
-                let declared = target_model
+                // Python prints what `_get_identity_fields` read: the
+                // declared value, or `None` when there is none.
+                let got = target_model
                     .metadata
                     .as_ref()
                     .and_then(|metadata| metadata.get("identity_fields"))
-                    .is_some();
-                let got = if declared || !identity.is_empty() {
-                    python_str_list_repr(identity)
-                } else {
-                    "None".to_string()
-                };
+                    .map_or_else(
+                        || "None".to_string(),
+                        |declared| plain_python_value(declared).to_repr(),
+                    );
                 return Err(DynamicGraphError::InvalidReferenceType(format!(
                     "{target} on {} needs exactly one identity_fields entry, got {got}",
                     field.name
@@ -943,7 +940,7 @@ fn resolve_identity_references(
                     "{target} on {} has required fields that cannot be filled from an identity \
                      string: {}",
                     field.name,
-                    python_str_list_repr(&offending)
+                    PyValue::List(offending.into_iter().map(PyValue::Str).collect()).to_repr()
                 )));
             }
             let narrowed = narrowed_identity_field(
@@ -5470,8 +5467,15 @@ mod from_identity_tests {
         );
         let compiled = DynamicGraphSchema::compile(&schema).unwrap();
         assert_eq!(
-            compiled.llm_schema()["$defs"]["Person"]["properties"]["role"]["$ref"],
-            json!("#/$defs/Role")
+            compiled.llm_schema()["$defs"]["Person"]["properties"]["role"],
+            json!({"$ref": "#/$defs/Role"}),
+            "the keyword never reaches the LLM, even when false"
+        );
+        assert!(
+            !compiled
+                .llm_schema()
+                .to_string()
+                .contains(FROM_IDENTITY_KEYWORD)
         );
     }
 
@@ -5552,6 +5556,111 @@ mod from_identity_tests {
             )),
             "Role on role needs exactly one identity_fields entry, got None"
         );
+        let mut null = role();
+        null["properties"]["metadata"] = metadata(Value::Null);
+        assert_eq!(
+            reference_error(team_schema_with(
+                null,
+                json!({"$ref": "#/$defs/Role", FROM_IDENTITY_KEYWORD: true})
+            )),
+            "Role on role needs exactly one identity_fields entry, got None"
+        );
+    }
+
+    /// Within one answer the first occurrence of an id is stored (Python's
+    /// walk). A model that declares the referencing field before the full
+    /// list therefore stores the identity-only node: Python's `Directory`
+    /// probe with `people` before `companies` stores `Acme` with
+    /// `founded=0`.
+    #[test]
+    fn the_first_occurrence_wins_even_when_it_is_a_reference() {
+        let schema = json!({
+            "title": "Directory",
+            "type": "object",
+            "properties": {
+                "people": {"type": "array", "items": {"$ref": "#/$defs/Person"}, "default": []},
+                "companies": {"type": "array", "items": {"$ref": "#/$defs/Company"}, "default": []},
+                "metadata": {"type": "object", "default": {"index_fields": [], "transparent": true}}
+            },
+            "$defs": {
+                "Company": {
+                    "title": "Company",
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "founded": {"type": "integer", "default": 0},
+                        "metadata": metadata(json!(["name"]))
+                    },
+                    "required": ["name"]
+                },
+                "Person": {
+                    "title": "Person",
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "employer": {
+                            "anyOf": [{"$ref": "#/$defs/Company"}, {"type": "null"}],
+                            "default": null,
+                            FROM_IDENTITY_KEYWORD: true
+                        },
+                        "metadata": metadata(json!(["name"]))
+                    },
+                    "required": ["name"]
+                }
+            }
+        });
+        let compiled = DynamicGraphSchema::compile(&schema).unwrap();
+        // Answer order does not matter; declaration order does.
+        let answer = json!({
+            "companies": [{"name": "Acme", "founded": 1999}],
+            "people": [{"name": "Alice", "employer": "Acme"}]
+        });
+        let graph = compiled.materialize(&answer, Uuid::nil()).unwrap();
+        let stored = store_dynamic_graph_batch([&graph], ChunkAttachment::Direct)
+            .pop()
+            .unwrap();
+        let companies: Vec<&DynamicDataPoint> = stored
+            .nodes
+            .iter()
+            .filter(|node| node.base.data_type == "Company")
+            .collect();
+        assert_eq!(companies.len(), 1);
+        assert_eq!(companies[0].properties["founded"], json!(0));
+    }
+
+    /// A target whose identity field it does not declare compiles (Python
+    /// does not check it, and the compile step warns that the identity has no
+    /// stable value), but each reference then becomes a node of its own, as
+    /// Python's random ids make it.
+    #[test]
+    fn an_undeclared_target_identity_field_mints_a_node_per_reference() {
+        // Python's probe: `name: str = ""`, `identity_fields = ["nickname"]`.
+        let mut nicknamed = role();
+        nicknamed["properties"]["name"]["default"] = json!("");
+        nicknamed["properties"]["metadata"] = metadata(json!(["nickname"]));
+        let compiled = DynamicGraphSchema::compile(&team_schema_with(
+            nicknamed,
+            json!({"$ref": "#/$defs/Role", FROM_IDENTITY_KEYWORD: true}),
+        ))
+        .unwrap();
+        assert_eq!(
+            compiled.llm_schema()["$defs"]["Person"]["properties"]["role"]["description"],
+            json!("The nickname of a Role already in the graph")
+        );
+        let answer = json!({
+            "name": "Core",
+            "members": [{"name": "Ada", "role": "x"}, {"name": "Bob", "role": "x"}]
+        });
+        let graph = compiled.materialize(&answer, Uuid::nil()).unwrap();
+        let roles: Vec<Uuid> = graph
+            .nodes
+            .iter()
+            .filter(|node| node.base.data_type == "Role")
+            .map(|node| node.base.id)
+            .collect();
+        assert_eq!(roles.len(), 2);
+        assert_ne!(roles[0], roles[1]);
+        assert!(roles.iter().all(|id| id.get_version_num() == 4));
     }
 
     #[test]
