@@ -7,6 +7,8 @@
 //!
 //! Gated behind the `pdf-pure-rust` feature.
 
+use super::format::format_document;
+#[cfg(test)]
 use super::format::format_pages;
 use super::startxref::repair_xref_offsets;
 use crate::loaders::LoaderError;
@@ -23,11 +25,11 @@ use crate::loaders::LoaderError;
 /// [`super::startxref`]). A file that parses is never rewritten, and the
 /// stored bytes are untouched either way.
 ///
-/// A parse that "succeeds" with no pages at all is an error. A PDF has at
-/// least one page, and `pdf-extract` stops at the first page number it cannot
-/// find, so zero pages means the page tree, or page 1, was unreadable. One
-/// known cause is an inline `/Encrypt` dictionary, which `lopdf` does not
-/// decrypt (see [`no_pages_error`]).
+/// A parse that "succeeds" with no pages at all is an error, as it is for
+/// every backend (see [`format_document`]). `pdf-extract` stops at the first
+/// page number it cannot find, so zero pages means the page tree, or page 1,
+/// was unreadable. One known cause is an inline `/Encrypt` dictionary, which
+/// `lopdf` does not decrypt (see [`no_pages_detail`]).
 ///
 /// A document with pages but no text (scanned or image-only, encrypted or
 /// not) still returns `""` with a warning, as PDFium and Python's pypdf do.
@@ -65,17 +67,13 @@ pub fn extract_text(bytes: &[u8]) -> Result<String, LoaderError> {
     };
     let parsed = repaired.as_deref().unwrap_or(bytes);
 
-    if page_texts.is_empty() {
-        return Err(no_pages_error(parsed));
-    }
-
     let pages: Vec<(usize, Result<String, String>)> = page_texts
         .into_iter()
         .enumerate()
         .map(|(idx, text)| (idx + 1, Ok(text)))
         .collect();
 
-    let text = format_pages(&pages);
+    let text = format_document(&pages, || no_pages_detail(parsed))?;
     // `format_pages` returns "" when every page extracted empty, and nothing
     // downstream treats that as a failure: ingest stores a zero-byte document
     // and reports success, the empty text embeds to a zero-norm vector, and
@@ -96,27 +94,56 @@ pub fn extract_text(bytes: &[u8]) -> Result<String, LoaderError> {
     Ok(text)
 }
 
-/// The error for a parse that produced no pages, naming the cause when it is
-/// encryption. Parses `bytes` again, so it is only reached on that path, never
-/// on a successful extraction.
-fn no_pages_error(bytes: &[u8]) -> LoaderError {
-    const UNREADABLE: &str = "PDF parsed but no pages could be read";
+/// Why a parse produced no pages, naming the cause when it is encryption, as
+/// the detail of [`format_document`]'s error. Parses `bytes` again, so it is
+/// only reached on that path, never on a successful extraction.
+///
+/// When the trailer has an `/Encrypt` that `lopdf` does not decrypt, it loads
+/// no objects at all (a unit test pins this), so such a file always ends up
+/// here, with or without object streams. That is why this check does not need
+/// to run on the success path.
+fn no_pages_detail(bytes: &[u8]) -> String {
     let doc = pdf_extract::Document::load_mem(bytes).ok();
-    let message = match &doc {
-        // `lopdf` removes `/Encrypt` from the trailer once it has decrypted,
-        // so one still there is an encryption it did not act on.
-        Some(doc) if doc.trailer.get(b"Encrypt").is_ok() => format!(
-            "{UNREADABLE}: the document is encrypted in a form the pdf-pure-rust backend \
-             cannot decrypt (for example an inline /Encrypt dictionary). The pdf-pdfium \
-             backend reads such files."
-        ),
-        Some(doc) if doc.was_encrypted() => format!(
-            "{UNREADABLE}: the document was decrypted, but its page tree or first page is \
-             unreadable."
-        ),
-        _ => format!("{UNREADABLE} (its page tree or first page is unreadable)."),
-    };
-    LoaderError::ExtractionFailed(message)
+    match doc
+        .as_ref()
+        .map(|doc| (trailer_encrypt(doc), doc.was_encrypted()))
+    {
+        Some((TrailerEncrypt::Dictionary, _)) => ": the document is encrypted in a form the \
+             pdf-pure-rust backend cannot decrypt (for example an inline /Encrypt dictionary). \
+             The pdf-pdfium backend reads such files."
+            .to_string(),
+        Some((TrailerEncrypt::NotADictionary, _)) => ": the trailer's /Encrypt entry is not an \
+             encryption dictionary, and the pdf-pure-rust backend reads no objects from a file \
+             with one."
+            .to_string(),
+        Some((TrailerEncrypt::Absent, true)) => ": the document was decrypted, but its page tree \
+             or first page is unreadable."
+            .to_string(),
+        _ => " (its page tree or first page is unreadable).".to_string(),
+    }
+}
+
+/// What a loaded document's trailer says about encryption.
+enum TrailerEncrypt {
+    /// No `/Encrypt`: the file was not encrypted, or `lopdf` decrypted it at
+    /// load time and removed the entry.
+    Absent,
+    /// An encryption dictionary, inline or indirect, that `lopdf` left in
+    /// place: an encryption it did not act on.
+    Dictionary,
+    /// Some other value (`null`, a number, a dangling reference). Not an
+    /// encryption, but `lopdf` still takes its encrypted-load path for it.
+    NotADictionary,
+}
+
+fn trailer_encrypt(doc: &pdf_extract::Document) -> TrailerEncrypt {
+    use pdf_extract::Object;
+    match doc.trailer.get(b"Encrypt") {
+        Err(_) => TrailerEncrypt::Absent,
+        Ok(Object::Dictionary(_)) => TrailerEncrypt::Dictionary,
+        Ok(Object::Reference(id)) if doc.get_dictionary(*id).is_ok() => TrailerEncrypt::Dictionary,
+        Ok(_) => TrailerEncrypt::NotADictionary,
+    }
 }
 
 fn extraction_failed(e: pdf_extract::OutputError) -> LoaderError {
@@ -379,6 +406,66 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("cannot decrypt"), "{msg}");
         assert!(msg.contains("pdf-pdfium"), "{msg}");
+    }
+
+    /// [`blank_page_pdf`]'s objects, unencrypted and with a valid page tree,
+    /// but with `/Encrypt {entry}` in the trailer, a value that is not an
+    /// encryption dictionary. The page tree does not matter: `lopdf` reads no
+    /// objects from such a file (see the test below).
+    fn pdf_with_trailer_encrypt(entry: &str) -> Vec<u8> {
+        let pdf = pdf_of(&[
+            "<< /Type /Catalog /Pages 2 0 R >>",
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>",
+            "<< /Length 0 >>\nstream\n\nendstream",
+        ]);
+        let pdf = String::from_utf8(pdf).unwrap();
+        pdf.replacen("/Root 1 0 R", &format!("/Root 1 0 R /Encrypt {entry}"), 1)
+            .into_bytes()
+    }
+
+    #[test]
+    fn an_encrypt_entry_that_is_not_a_dictionary_is_not_blamed_on_encryption() {
+        // `lopdf` takes its encrypted-load path for any trailer `/Encrypt`,
+        // whatever its value, and loads no objects when it cannot
+        // authenticate, so these files have no pages. They are not encrypted,
+        // though, and the message must not send the user looking for a
+        // decryption problem.
+        for entry in ["null", "42", "/Junk", "99 0 R"] {
+            let pdf = pdf_with_trailer_encrypt(entry);
+            assert!(
+                pdf_extract::extract_text_from_mem_by_pages(&pdf)
+                    .unwrap()
+                    .is_empty(),
+                "/Encrypt {entry}: the guard this test relies on no longer holds"
+            );
+            let err = extract_text(&pdf).expect_err("zero pages");
+            assert!(matches!(err, LoaderError::ExtractionFailed(_)), "{err}");
+            let msg = err.to_string();
+            assert!(!msg.contains("cannot decrypt"), "/Encrypt {entry}: {msg}");
+            assert!(!msg.contains("pdf-pdfium"), "/Encrypt {entry}: {msg}");
+            assert!(
+                msg.contains("not an encryption dictionary"),
+                "/Encrypt {entry}: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn lopdf_loads_no_objects_from_a_file_it_does_not_decrypt() {
+        // Why the undecryptable-encryption check only needs to run when there
+        // are no pages: when the trailer has an `/Encrypt` that `lopdf` does
+        // not act on, it loads no objects at all, so the page tree is never
+        // visible as cleartext with the content streams left as ciphertext.
+        // This holds whether or not the file uses object streams (the fixture
+        // has none: its catalog and page tree are plain dictionaries). If a
+        // `lopdf` upgrade starts loading such files without decrypting them,
+        // this fails, and `extract_text` has to check `/Encrypt` on every
+        // parse instead.
+        let doc = pdf_extract::Document::load_mem(INLINE_ENCRYPT_PDF).unwrap();
+        assert!(doc.trailer.get(b"Encrypt").is_ok());
+        assert!(doc.objects.is_empty(), "{:?}", doc.objects.keys());
+        assert!(doc.get_pages().is_empty());
     }
 
     #[test]

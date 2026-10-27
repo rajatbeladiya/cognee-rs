@@ -59,7 +59,7 @@
     reason = "tests drive configuration through the process env"
 )]
 
-use cognee_ingestion::loaders::{DocumentLoader, LoaderOutput, pdf::PdfLoader};
+use cognee_ingestion::loaders::{DocumentLoader, LoaderError, LoaderOutput, pdf::PdfLoader};
 use cognee_models::{DataPoint, Document};
 use encrypted::ENCRYPTED_EMPTY_USER_PASSWORD;
 use uuid::Uuid;
@@ -127,11 +127,66 @@ async fn extracts_text_from_a_pdf_encrypted_with_an_empty_user_password() {
     }
 }
 
-/// Extracts `bytes` with [`PdfLoader`] and asserts the output is
-/// `sample.expected.txt`. Returns `false`, after printing a notice naming
-/// `test`, if libpdfium could not be obtained (see the module docs).
-async fn assert_extracts_the_sample_text(test: &str, name: &str, bytes: &[u8]) -> bool {
-    let doc = Document {
+/// `sample.pdf` encrypted by `mutool clean -E rc4-128` with `/Encrypt` left
+/// inline in the trailer. The pure-rust backend cannot read it and its error
+/// says "The pdf-pdfium backend reads such files"; this pins that claim.
+const INLINE_ENCRYPT_PDF: &[u8] =
+    include_bytes!("fixtures/pdf/sample.encrypted-inline-rc4-128.pdf");
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn extracts_text_from_a_pdf_with_an_inline_encrypt_dictionary() {
+    let _ = assert_extracts_the_sample_text(
+        "extracts_text_from_a_pdf_with_an_inline_encrypt_dictionary",
+        "sample.encrypted-inline-rc4-128.pdf",
+        INLINE_ENCRYPT_PDF,
+    )
+    .await;
+}
+
+/// A classic-xref PDF whose objects are `objects`, numbered from 1, with
+/// object 1 as the catalog.
+fn pdf_of(objects: &[&str]) -> Vec<u8> {
+    let mut pdf = b"%PDF-1.7\n".to_vec();
+    let mut offsets = Vec::new();
+    for (i, body) in objects.iter().enumerate() {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{} 0 obj\n{body}\nendobj\n", i + 1).as_bytes());
+    }
+    let xref = pdf.len();
+    let size = objects.len() + 1;
+    pdf.extend_from_slice(format!("xref\n0 {size}\n0000000000 65535 f \n").as_bytes());
+    for offset in offsets {
+        pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(
+        format!("trailer\n<< /Size {size} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
+    );
+    pdf
+}
+
+/// Zero pages is an error whichever backend reads the file, not only under
+/// `pdf-pure-rust`: a PDF has at least one page, and storing such a file as an
+/// empty document hides it from search while `add` reports success.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rejects_a_pdf_with_no_pages() {
+    const TEST: &str = "rejects_a_pdf_with_no_pages";
+    let pdf = pdf_of(&[
+        "<< /Type /Catalog /Pages 2 0 R >>",
+        "<< /Type /Pages /Kids [] /Count 0 >>",
+    ]);
+    let result = PdfLoader.extract(&pdf, &document("no-pages.pdf")).await;
+    match result {
+        Err(e) if e.to_string().contains(LIBRARY_UNOBTAINABLE) => skip(TEST, &e),
+        Err(LoaderError::ExtractionFailed(msg)) => {
+            assert!(msg.contains("no pages"), "{msg}");
+            assert!(!msg.contains("encrypt"), "{msg}");
+        }
+        other => panic!("zero pages is never a valid extraction: {other:?}"),
+    }
+}
+
+fn document(name: &str) -> Document {
+    Document {
         base: DataPoint::new("PdfDocument", None),
         document_type: "pdf".to_string(),
         name: name.to_string(),
@@ -140,22 +195,33 @@ async fn assert_extracts_the_sample_text(test: &str, name: &str, bytes: &[u8]) -
         extension: "pdf".to_string(),
         data_id: Uuid::new_v4(),
         external_metadata: None,
-    };
+    }
+}
 
-    let output = match PdfLoader.extract(bytes, &doc).await {
+/// Fails in CI, where libpdfium must be obtainable, and otherwise prints the
+/// skip notice. See the module docs.
+fn skip(test: &str, e: &LoaderError) {
+    assert!(
+        !in_ci(),
+        "{test}: libpdfium could not be obtained, so real-PDF extraction never ran — \
+         and a CI lane must not report green on that. Provision the library and set \
+         PDFIUM_LIB_PATH. Cause: {e}"
+    );
+    eprintln!(
+        "SKIP {test}: libpdfium could not be obtained on this machine, so real-PDF \
+         extraction was NOT verified. Set PDFIUM_LIB_PATH to an existing libpdfium \
+         shared library to run it. Cause: {e}"
+    );
+}
+
+/// Extracts `bytes` with [`PdfLoader`] and asserts the output is
+/// `sample.expected.txt`. Returns `false`, after printing a notice naming
+/// `test`, if libpdfium could not be obtained (see the module docs).
+async fn assert_extracts_the_sample_text(test: &str, name: &str, bytes: &[u8]) -> bool {
+    let output = match PdfLoader.extract(bytes, &document(name)).await {
         Ok(output) => output,
         Err(e) if e.to_string().contains(LIBRARY_UNOBTAINABLE) => {
-            assert!(
-                !in_ci(),
-                "{test}: libpdfium could not be obtained, so real-PDF extraction never ran — \
-                 and a CI lane must not report green on that. Provision the library and set \
-                 PDFIUM_LIB_PATH. Cause: {e}"
-            );
-            eprintln!(
-                "SKIP {test}: libpdfium could not be obtained on this machine, so real-PDF \
-                 extraction was NOT verified. Set PDFIUM_LIB_PATH to an existing libpdfium \
-                 shared library to run it. Cause: {e}"
-            );
+            skip(test, &e);
             return false;
         }
         Err(e) => panic!("{name}: extraction of a valid PDF failed: {e}"),

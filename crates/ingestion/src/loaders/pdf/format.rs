@@ -5,6 +5,33 @@
 //! `pypdf_loader.py:70-84` format. The page text each hands *in* is not — see
 //! the [`super`] module docs for the measured difference.
 
+use crate::loaders::LoaderError;
+
+/// The start of every zero-page error, whichever backend raised it.
+pub const NO_PAGES: &str = "PDF parsed but no pages could be read";
+
+/// [`format_pages`] for a whole document, with the rule both backends share:
+/// a document with no pages is an error, not an empty text.
+///
+/// A PDF has at least one page. A parse that yields none means the page tree
+/// is empty or unreadable, and storing that as an empty document would make
+/// `add` report success for a file nothing can find. `no_pages_detail` is the
+/// backend's explanation of why, appended to [`NO_PAGES`]; it is only called
+/// on that path. Pages that exist but carry no text (scanned, image-only,
+/// blank) are not affected and still format to `""`.
+pub fn format_document(
+    pages: &[(usize, Result<String, String>)],
+    no_pages_detail: impl FnOnce() -> String,
+) -> Result<String, LoaderError> {
+    if pages.is_empty() {
+        return Err(LoaderError::ExtractionFailed(format!(
+            "{NO_PAGES}{}",
+            no_pages_detail()
+        )));
+    }
+    Ok(format_pages(pages))
+}
+
 /// Formats per-page text into the Python-compatible output format.
 ///
 /// Pages are 1-indexed. Empty pages and failed pages are skipped.
@@ -30,6 +57,7 @@ pub fn format_pages(pages: &[(usize, Result<String, String>)]) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, reason = "test code")]
 mod tests {
     use super::*;
 
@@ -89,6 +117,23 @@ mod tests {
     fn no_pages_returns_empty_string() {
         let pages: Vec<(usize, Result<String, String>)> = vec![];
         assert_eq!(format_pages(&pages), "");
+    }
+
+    #[test]
+    fn a_document_with_no_pages_is_an_error() {
+        let err = format_document(&[], || " (detail).".to_string()).unwrap_err();
+        assert!(matches!(err, LoaderError::ExtractionFailed(_)), "{err}");
+        assert!(
+            err.to_string().ends_with(&format!("{NO_PAGES} (detail).")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_document_whose_pages_have_no_text_formats_to_empty() {
+        let pages = vec![(1, Ok(" ".to_string())), (2, Err("bad page".to_string()))];
+        let text = format_document(&pages, || unreachable!("the document has pages")).unwrap();
+        assert_eq!(text, "");
     }
 
     #[test]
