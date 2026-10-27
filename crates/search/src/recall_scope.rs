@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
 use uuid::Uuid;
 
-use crate::observability::COGNEE_SEARCH_TYPE;
+use crate::observability::{COGNEE_RECALL_ROUTE_RULE, COGNEE_SEARCH_TYPE};
 use crate::types::SearchError;
 use crate::{
     ROUTER_FALLBACK_TYPE, SearchOrchestrator, SearchRequest, SearchResponse, SearchType,
@@ -489,6 +489,9 @@ pub async fn run_graph(
     let auto_routed = routed_rule.is_some();
 
     span.record(COGNEE_SEARCH_TYPE, format!("{search_type:?}").as_str());
+    if let Some(rule) = routed_rule {
+        span.record(COGNEE_RECALL_ROUTE_RULE, rule);
+    }
 
     // Under per-dataset storage an unfiltered graph search covers the datasets
     // the caller may read, which needs a caller. With none (or one that is not

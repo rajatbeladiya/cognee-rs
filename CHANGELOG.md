@@ -27,6 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `HYBRID_COMPLETION`. A routed type the backend rejects
   (`SearchError::UnsupportedSearchType`), or a routed `CHUNKS_LEXICAL` /
   `CODING_RULES` search that finds nothing, is retried as `HYBRID_COMPLETION`.
+  The recall span records the matched rule as `cognee.recall.route_rule`.
 
   **Migration.** `route_query` returns `RouteDecision { search_type, rule }`
   instead of `RouteResult`, which is removed with its scores (`confidence`,
