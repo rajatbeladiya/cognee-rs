@@ -26,7 +26,7 @@ pub use orchestration::{
     DatasetSearchResult, SearchBuilder, SearchOrchestrator, SearchTuning, SearchTypeRegistry,
     merge_dataset_results,
 };
-pub use query_router::{RouteResult, route_query};
+pub use query_router::{ROUTER_FALLBACK_TYPE, RouteDecision, route_query};
 pub use recall_scope::{RecallItem, RecallScope, RecallSource, ScopeInput, normalize_scope};
 pub use retrievers::{
     ChunksRetriever, CodingRulesRetriever, CompletionRetriever, CypherSearchRetriever,

@@ -19,7 +19,10 @@ use uuid::Uuid;
 
 use crate::observability::COGNEE_SEARCH_TYPE;
 use crate::types::SearchError;
-use crate::{SearchOrchestrator, SearchRequest, SearchResponse, SearchType, route_query};
+use crate::{
+    ROUTER_FALLBACK_TYPE, SearchOrchestrator, SearchRequest, SearchResponse, SearchType,
+    route_query,
+};
 
 /// Advanced tuning options forwarded from `cognee::api::recall::RecallOptions`.
 ///
@@ -475,16 +478,8 @@ pub async fn run_graph(
 
     let (search_type, auto_routed) = match (query_type, auto_route) {
         (Some(qt), _) => (qt, false),
-        (None, true) => {
-            let routed = route_query(query_text);
-            debug!(
-                search_type = ?routed.search_type,
-                confidence = routed.confidence,
-                "recall: auto-routed query"
-            );
-            (routed.search_type, true)
-        }
-        (None, false) => (SearchType::GraphCompletion, false),
+        (None, true) => (route_query(query_text).search_type, true),
+        (None, false) => (ROUTER_FALLBACK_TYPE, false),
     };
 
     span.record(COGNEE_SEARCH_TYPE, format!("{search_type:?}").as_str());

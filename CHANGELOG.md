@@ -18,6 +18,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking changes
 
+- **`cognee-search`: recall routes with Python's ordered rule router, and an
+  unmatched query runs `HYBRID_COMPLETION`.** `route_query` checks three rules
+  in order — a quoted phrase → `CHUNKS_LEXICAL`, coding-rules wording →
+  `CODING_RULES`, a time preposition before an absolute date → `TEMPORAL` — and
+  falls back to `ROUTER_FALLBACK_TYPE` (`HYBRID_COMPLETION`, was
+  `GRAPH_COMPLETION`). Recall with `auto_route = false` and no type also runs
+  `HYBRID_COMPLETION`.
+
+  **Migration.** `route_query` returns `RouteDecision { search_type, rule }`
+  instead of `RouteResult`, which is removed with its scores (`confidence`,
+  `runner_up`, `runner_up_score`, `all_scores`, `is_confident`). The override
+  statistics are removed, as in
+  Python: `record_override`, `override_counts_snapshot`,
+  `clear_override_counts` and the `query_router_stats` module.
+
 - **Delete lock hook, search scoping accessor, pipeline-runs listing +
   `pipeline_runs.user_id`.** Python serializes deletes against pipeline runs
   with one per-dataset lock (`dataset_lock.py`, cognee 37f788bd2); its
