@@ -8,8 +8,6 @@ pub mod observability;
 pub mod orchestration;
 /// Query router that maps natural-language queries to `SearchType`s.
 pub mod query_router;
-/// Query router override-count statistics.
-pub mod query_router_stats;
 /// `RecallScope` and related types for scoping search results.
 pub mod recall_scope;
 /// Individual retriever implementations for each `SearchType`.
@@ -29,7 +27,6 @@ pub use orchestration::{
     merge_dataset_results,
 };
 pub use query_router::{RouteResult, route_query};
-pub use query_router_stats::{clear_override_counts, override_counts_snapshot, record_override};
 pub use recall_scope::{RecallItem, RecallScope, RecallSource, ScopeInput, normalize_scope};
 pub use retrievers::{
     ChunksRetriever, CodingRulesRetriever, CompletionRetriever, CypherSearchRetriever,

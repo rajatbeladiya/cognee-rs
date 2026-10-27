@@ -19,9 +19,7 @@ use uuid::Uuid;
 
 use crate::observability::COGNEE_SEARCH_TYPE;
 use crate::types::SearchError;
-use crate::{
-    SearchOrchestrator, SearchRequest, SearchResponse, SearchType, record_override, route_query,
-};
+use crate::{SearchOrchestrator, SearchRequest, SearchResponse, SearchType, route_query};
 
 /// Advanced tuning options forwarded from `cognee::api::recall::RecallOptions`.
 ///
@@ -475,15 +473,8 @@ pub async fn run_graph(
         },
     };
 
-    // Python recall.py:458-472: still run the router on explicit query_type
-    // + auto_route=true so the override gets recorded.
     let (search_type, auto_routed) = match (query_type, auto_route) {
-        (Some(qt), true) => {
-            let routed = route_query(query_text);
-            record_override(routed.search_type, qt);
-            (qt, false)
-        }
-        (Some(qt), false) => (qt, false),
+        (Some(qt), _) => (qt, false),
         (None, true) => {
             let routed = route_query(query_text);
             debug!(
