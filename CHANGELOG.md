@@ -24,7 +24,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `CODING_RULES`, a time preposition before an absolute date → `TEMPORAL` — and
   falls back to `ROUTER_FALLBACK_TYPE` (`HYBRID_COMPLETION`, was
   `GRAPH_COMPLETION`). Recall with `auto_route = false` and no type also runs
-  `HYBRID_COMPLETION`.
+  `HYBRID_COMPLETION`. A routed type the backend rejects
+  (`SearchError::UnsupportedSearchType`), or a routed `CHUNKS_LEXICAL` /
+  `CODING_RULES` search that finds nothing, is retried as `HYBRID_COMPLETION`.
 
   **Migration.** `route_query` returns `RouteDecision { search_type, rule }`
   instead of `RouteResult`, which is removed with its scores (`confidence`,

@@ -117,3 +117,33 @@ async fn without_auto_routing_recall_runs_the_fallback() {
     assert_eq!(result.search_type_used, Some(SearchType::HybridCompletion));
     assert!(!result.auto_routed);
 }
+
+#[tokio::test]
+async fn a_routed_coding_rules_search_that_finds_nothing_runs_the_fallback() {
+    let orchestrator = orchestrator(vec![
+        (SearchType::CodingRules, SearchOutput::Rules(Vec::new())),
+        (SearchType::HybridCompletion, answer()),
+    ]);
+    let query = "What are the coding rules mentioned?";
+    let result = recall_graph(&orchestrator, query, None, true).await;
+    assert_eq!(result.search_type_used, Some(SearchType::HybridCompletion));
+}
+
+#[tokio::test]
+async fn a_routed_type_the_backend_does_not_support_runs_the_fallback() {
+    let orchestrator = orchestrator(vec![(SearchType::HybridCompletion, answer())]);
+    let query = "What are the coding rules mentioned?";
+    let result = recall_graph(&orchestrator, query, None, true).await;
+    assert_eq!(result.search_type_used, Some(SearchType::HybridCompletion));
+}
+
+#[tokio::test]
+async fn an_explicit_type_that_finds_nothing_is_not_retried() {
+    let orchestrator = orchestrator(vec![
+        (SearchType::CodingRules, SearchOutput::Rules(Vec::new())),
+        (SearchType::HybridCompletion, answer()),
+    ]);
+    let query = "What are the coding rules mentioned?";
+    let result = recall_graph(&orchestrator, query, Some(SearchType::CodingRules), true).await;
+    assert_eq!(result.search_type_used, Some(SearchType::CodingRules));
+}

@@ -14,7 +14,7 @@ use std::collections::HashSet;
 
 use cognee_session::{SessionManager, SessionStore};
 use serde::{Deserialize, Serialize};
-use tracing::debug;
+use tracing::{debug, info};
 use uuid::Uuid;
 
 use crate::observability::COGNEE_SEARCH_TYPE;
@@ -476,11 +476,17 @@ pub async fn run_graph(
         },
     };
 
-    let (search_type, auto_routed) = match (query_type, auto_route) {
-        (Some(qt), _) => (qt, false),
-        (None, true) => (route_query(query_text).search_type, true),
-        (None, false) => (ROUTER_FALLBACK_TYPE, false),
+    // `routed_rule` is set only when the router chose the type, so the retry
+    // below never second-guesses an explicit type.
+    let (mut search_type, routed_rule) = match (query_type, auto_route) {
+        (Some(qt), _) => (qt, None),
+        (None, true) => {
+            let decision = route_query(query_text);
+            (decision.search_type, Some(decision.rule))
+        }
+        (None, false) => (ROUTER_FALLBACK_TYPE, None),
     };
+    let auto_routed = routed_rule.is_some();
 
     span.record(COGNEE_SEARCH_TYPE, format!("{search_type:?}").as_str());
 
@@ -506,7 +512,7 @@ pub async fn run_graph(
         return Ok((Vec::new(), search_type, auto_routed, response));
     }
 
-    let request = SearchRequest {
+    let mut request = SearchRequest {
         query_text: query_text.to_string(),
         search_type,
         top_k: Some(top_k),
@@ -535,7 +541,27 @@ pub async fn run_graph(
         summarize_context: None,
     };
 
-    let response = search_orchestrator.search(&request).await?;
+    // The router picked something other than the fallback, so the fallback is
+    // still untried and may replace this result.
+    let routed_guess = routed_rule.is_some() && search_type != ROUTER_FALLBACK_TYPE;
+    let mut response = match search_orchestrator.search(&request).await {
+        Err(SearchError::UnsupportedSearchType(rejected)) if routed_guess => {
+            info!(
+                ?rejected,
+                "recall: routed search type is not supported; retrying as the fallback"
+            );
+            request.search_type = ROUTER_FALLBACK_TYPE;
+            search_orchestrator.search(&request).await?
+        }
+        result => result?,
+    };
+    if routed_guess && RETRY_ON_EMPTY.contains(&request.search_type) && is_empty(&response.result) {
+        info!(search_type = ?request.search_type, "recall: routed search found nothing; retrying as the fallback");
+        request.search_type = ROUTER_FALLBACK_TYPE;
+        response = search_orchestrator.search(&request).await?;
+    }
+    search_type = request.search_type;
+    span.record(COGNEE_SEARCH_TYPE, format!("{search_type:?}").as_str());
 
     let items: Vec<RecallItem> = match &response.result {
         crate::SearchOutput::Items(search_items) => search_items
@@ -571,6 +597,18 @@ pub async fn run_graph(
     };
 
     Ok((items, search_type, auto_routed, response))
+}
+
+/// Routed types whose empty result is retried as [`ROUTER_FALLBACK_TYPE`]: a
+/// lexical or rules search that finds nothing says nothing about the question.
+const RETRY_ON_EMPTY: [SearchType; 2] = [SearchType::ChunksLexical, SearchType::CodingRules];
+
+fn is_empty(output: &crate::SearchOutput) -> bool {
+    match output {
+        crate::SearchOutput::Items(items) => items.is_empty(),
+        crate::SearchOutput::Rules(rules) => rules.is_empty(),
+        _ => false,
+    }
 }
 
 /// Tokenize text into lowercase words of length >= 2.
