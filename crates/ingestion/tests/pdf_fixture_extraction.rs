@@ -60,9 +60,8 @@
 )]
 
 use cognee_ingestion::loaders::{DocumentLoader, LoaderError, LoaderOutput, pdf::PdfLoader};
-use cognee_models::{DataPoint, Document};
 use encrypted::ENCRYPTED_EMPTY_USER_PASSWORD;
-use uuid::Uuid;
+use support::{ENCRYPT_NULL_TEXT, document, encrypt_null_pdf, pdf_of};
 
 /// A two-page, uncompressed, base-14-font PDF authored in this repository.
 /// See `fixtures/pdf/README.md` for provenance and how to regenerate it.
@@ -70,6 +69,9 @@ const SAMPLE_PDF: &[u8] = include_bytes!("fixtures/pdf/sample.pdf");
 
 #[path = "fixtures/pdf/encrypted.rs"]
 mod encrypted;
+
+#[path = "fixtures/pdf/support.rs"]
+mod support;
 
 /// The loader's expected output, CRLF-normalised — see [`normalise`].
 const EXPECTED: &str = include_str!("fixtures/pdf/sample.expected.txt");
@@ -143,37 +145,19 @@ async fn extracts_text_from_a_pdf_with_an_inline_encrypt_dictionary() {
     .await;
 }
 
-/// A classic-xref PDF whose objects are `objects`, numbered from 1, with
-/// object 1 as the catalog.
-fn pdf_of(objects: &[&str]) -> Vec<u8> {
-    let mut pdf = b"%PDF-1.7\n".to_vec();
-    let mut offsets = Vec::new();
-    for (i, body) in objects.iter().enumerate() {
-        offsets.push(pdf.len());
-        pdf.extend_from_slice(format!("{} 0 obj\n{body}\nendobj\n", i + 1).as_bytes());
-    }
-    let xref = pdf.len();
-    let size = objects.len() + 1;
-    pdf.extend_from_slice(format!("xref\n0 {size}\n0000000000 65535 f \n").as_bytes());
-    for offset in offsets {
-        pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
-    }
-    pdf.extend_from_slice(
-        format!("trailer\n<< /Size {size} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
-    );
-    pdf
-}
-
 /// Zero pages is an error whichever backend reads the file, not only under
 /// `pdf-pure-rust`: a PDF has at least one page, and storing such a file as an
 /// empty document hides it from search while `add` reports success.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rejects_a_pdf_with_no_pages() {
     const TEST: &str = "rejects_a_pdf_with_no_pages";
-    let pdf = pdf_of(&[
-        "<< /Type /Catalog /Pages 2 0 R >>",
-        "<< /Type /Pages /Kids [] /Count 0 >>",
-    ]);
+    let pdf = pdf_of(
+        &[
+            "<< /Type /Catalog /Pages 2 0 R >>",
+            "<< /Type /Pages /Kids [] /Count 0 >>",
+        ],
+        "",
+    );
     let result = PdfLoader.extract(&pdf, &document("no-pages.pdf")).await;
     match result {
         Err(e) if e.to_string().contains(LIBRARY_UNOBTAINABLE) => skip(TEST, &e),
@@ -185,16 +169,22 @@ async fn rejects_a_pdf_with_no_pages() {
     }
 }
 
-fn document(name: &str) -> Document {
-    Document {
-        base: DataPoint::new("PdfDocument", None),
-        document_type: "pdf".to_string(),
-        name: name.to_string(),
-        raw_data_location: format!("file:///{name}"),
-        mime_type: "application/pdf".to_string(),
-        extension: "pdf".to_string(),
-        data_id: Uuid::new_v4(),
-        external_metadata: None,
+/// The pure-rust backend's error for a file whose `/Encrypt` it cannot use
+/// says "The pdf-pdfium backend reads such files" when the value is not an
+/// encryption dictionary; this pins that for `/Encrypt null`. (pure-rust now
+/// reads such a file itself, unless the key occurs more than once.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn extracts_text_from_a_pdf_whose_encrypt_entry_is_null() {
+    const TEST: &str = "extracts_text_from_a_pdf_whose_encrypt_entry_is_null";
+    match PdfLoader
+        .extract(&encrypt_null_pdf(), &document("encrypt-null.pdf"))
+        .await
+    {
+        Err(e) if e.to_string().contains(LIBRARY_UNOBTAINABLE) => skip(TEST, &e),
+        Ok(LoaderOutput::Text(text)) => {
+            assert!(text.contains(ENCRYPT_NULL_TEXT), "{text:?}");
+        }
+        other => panic!("an /Encrypt null file is not encrypted: {other:?}"),
     }
 }
 

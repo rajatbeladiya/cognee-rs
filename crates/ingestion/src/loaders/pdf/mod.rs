@@ -24,8 +24,9 @@
 //! and `tests/pdf_pure_rust_fixture_extraction.rs` pin each backend's output.
 //!
 //! Both backends also share one rule, in `format::format_document`: a document
-//! with no pages is `LoaderError::ExtractionFailed`, never an empty text. Pages
-//! without text (scanned, image-only) still extract to `""`.
+//! with no pages, or whose every page failed, is
+//! `LoaderError::ExtractionFailed`, never an empty text. Pages that were read
+//! but have no text (scanned, image-only) still extract to `""`.
 
 mod format;
 

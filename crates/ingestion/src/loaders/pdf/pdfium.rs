@@ -75,7 +75,7 @@ pub(super) async fn ensure_library() -> Result<&'static Path, LoaderError> {
 /// Returns the formatted text with page headers matching the Python
 /// `pypdf_loader.py` output format. Per-page errors are logged and
 /// skipped; the extraction continues with remaining pages. A document with no
-/// pages at all is an error (see [`format_document`]).
+/// pages, or whose every page failed, is an error (see [`format_document`]).
 pub fn extract_text(bytes: &[u8], lib_path: &Path) -> Result<String, LoaderError> {
     let pdfium = pdfium_auto::bind_pdfium_from_path(lib_path).map_err(|e| {
         LoaderError::ExtractionFailed(format!("Failed to load PDFium library: {e}"))
@@ -101,7 +101,8 @@ pub fn extract_text(bytes: &[u8], lib_path: &Path) -> Result<String, LoaderError
 
     // PDFium is lenient about broken page trees, so zero pages here is most
     // likely a document whose tree really is empty.
-    format_document(&pages, || {
-        " (the document has no pages, or its page tree is unreadable).".to_string()
-    })
+    format_document(
+        &pages,
+        " (the document has no pages, or its page tree is unreadable).",
+    )
 }
